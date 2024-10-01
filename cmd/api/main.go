@@ -69,10 +69,10 @@ func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 var (
-	version      = "unknown"
-	buildMachine = "unknown"
-	buildTime    = "unknown"
-	goVersion    = "unknown"
+	version      = "v1.3.3"
+	buildMachine = "AlmaLinux release 9.3 (Shamrock Pampas Cat)"
+	buildTime    = "Tue Oct 1 07:52:10 UTC 2024"
+	goVersion    = "go1.22.4 linux/amd64"
 )
 
 func main() {
@@ -460,7 +460,7 @@ func main() {
 	timelineKeeper.Start(context.Background())
 	agent.Boot()
 
-	port := ":8000"
+	port := "192.168.10.14:8010"
 	envport := os.Getenv("CC_API_PORT")
 	if envport != "" {
 		port = ":" + envport

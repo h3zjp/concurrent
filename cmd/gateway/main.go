@@ -381,7 +381,7 @@ func main() {
 
 	e.GET("/metrics", echoprometheus.NewHandler())
 
-	port := ":8080"
+	port := "192.168.10.14:8080"
 	envport := os.Getenv("CC_GATEWAY_PORT")
 	if envport != "" {
 		port = ":" + envport
