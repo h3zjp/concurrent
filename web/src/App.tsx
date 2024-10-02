@@ -71,13 +71,7 @@ function App(): JSX.Element {
                     alignItems='center'
                     gap='10px'
                 >
-                    Powered By
-                    <Box
-                        component="img"
-                        height="50px"
-                        borderRadius={1}
-                        src={profile?.wordmark}
-                    />
+                    Hosted by <a href="https://h3z.jp/" target="_blank" title="七海灯 (h3zjp)">七海灯 (h3zjp)</a>
                 </Box>
             </Box>
             <Paper
