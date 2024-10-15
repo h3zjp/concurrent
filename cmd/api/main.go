@@ -96,7 +96,7 @@ func main() {
 
 	err := config.Load(configPath)
 	if err != nil {
-		slog.Error("Failed to load config: ", err)
+		slog.Error("Failed to load config: ", slog.String("error", err.Error()))
 	}
 
 	conconf := core.SetupConfig(config.Concrnt)
@@ -184,6 +184,8 @@ func main() {
 		&core.SubscriptionItem{},
 		&core.SemanticID{},
 		&core.Job{},
+		&core.CommitLog{},
+		&core.CommitOwner{},
 	)
 
 	if err != nil {
@@ -191,8 +193,8 @@ func main() {
 	}
 
 	// migration from 1.3.2 to 1.3.3
-	db.Model(&core.Timeline{}).Where("owner IS NULL").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
-	db.Model(&core.Subscription{}).Where("owner IS NULL").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
+	db.Model(&core.Timeline{}).Where("owner IS NULL or domain_owned = true").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
+	db.Model(&core.Subscription{}).Where("owner IS NULL or domain_owned = true").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     config.Server.RedisAddr,
@@ -221,7 +223,6 @@ func main() {
 	globalPolicy := concurrent.GetDefaultGlobalPolicy()
 
 	policy := concurrent.SetupPolicyService(rdb, globalPolicy, conconf)
-	agent := concurrent.SetupAgent(db, rdb, mc, timelineKeeper, client, policy, conconf, config.Server.RepositoryPath)
 
 	domainService := concurrent.SetupDomainService(db, client, conconf)
 	domainHandler := domain.NewHandler(domainService)
@@ -261,6 +262,7 @@ func main() {
 
 	jobService := concurrent.SetupJobService(db)
 	jobHandler := job.NewHandler(jobService)
+	jobReactor := job.NewReactor(storeService, jobService)
 
 	// migration from 1.3.2 to 1.3.3
 	var remotes []core.Domain
@@ -361,6 +363,8 @@ func main() {
 	// storage
 	apiV1.GET("/repository", storeHandler.Get, auth.Restrict(auth.ISREGISTERED))
 	apiV1.POST("/repository", storeHandler.Post, auth.Restrict(auth.ISLOCAL))
+	apiV1.GET("/repositories/sync", storeHandler.GetSyncStatus, auth.Restrict(auth.ISREGISTERED))
+	apiV1.POST("/repositories/sync", storeHandler.PerformSync, auth.Restrict(auth.ISREGISTERED))
 
 	// job
 	apiV1.GET("/jobs", jobHandler.List, auth.Restrict(auth.ISREGISTERED))
@@ -458,7 +462,7 @@ func main() {
 	e.GET("/metrics", echoprometheus.NewHandler())
 
 	timelineKeeper.Start(context.Background())
-	agent.Boot()
+	jobReactor.Start(context.Background())
 
 	port := "192.168.10.14:8010"
 	envport := os.Getenv("CC_API_PORT")

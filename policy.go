@@ -269,8 +269,13 @@ var globalPolicyJson = `
                 "op": "Or",
                 "args": [
                     {
-                        "op": "LoadSelf",
-                        "const": "domainOwned"
+                        "op": "IsCSID",
+                        "args": [
+                            {
+                                "op": "LoadSelf",
+                                "const": "owner"
+                            }
+                        ]
                     },
                     {
                         "op": "Eq",
@@ -283,6 +288,10 @@ var globalPolicyJson = `
                                 "op": "RequesterID"
                             }
                         ]
+                    },
+                    {
+                        "op": "LoadSelf",
+                        "const": "domainOwned"
                     }
                 ]
             }
@@ -292,8 +301,13 @@ var globalPolicyJson = `
                 "op": "Or",
                 "args": [
                     {
-                        "op": "LoadSelf",
-                        "const": "domainOwned"
+                        "op": "IsCSID",
+                        "args": [
+                            {
+                                "op": "LoadSelf",
+                                "const": "owner"
+                            }
+                        ]
                     },
                     {
                         "op": "Eq",
@@ -306,6 +320,10 @@ var globalPolicyJson = `
                                 "op": "RequesterID"
                             }
                         ]
+                    },
+                    {
+                        "op": "LoadSelf",
+                        "const": "domainOwned"
                     }
                 ]
             }

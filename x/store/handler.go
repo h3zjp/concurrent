@@ -18,6 +18,8 @@ type Handler interface {
 	Commit(c echo.Context) error
 	Get(c echo.Context) error
 	Post(c echo.Context) error
+	GetSyncStatus(c echo.Context) error
+	PerformSync(c echo.Context) error
 }
 
 type handler struct {
@@ -60,7 +62,9 @@ func (h *handler) Commit(c echo.Context) error {
 		keys = []core.Key{}
 	}
 
-	result, err := h.service.Commit(ctx, core.CommitModeExecute, request.Document, request.Signature, request.Option, keys)
+	requesterIP := c.RealIP()
+
+	result, err := h.service.Commit(ctx, core.CommitModeExecute, request.Document, request.Signature, request.Option, keys, requesterIP)
 	if err != nil {
 		if errors.Is(err, core.ErrorPermissionDenied{}) {
 			return c.JSON(http.StatusForbidden, echo.Map{"status": "error", "error": err.Error()})
@@ -88,11 +92,45 @@ func (h *handler) Get(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized"})
 	}
 
-	path := h.service.GetPath(ctx, requester)
+	path := fmt.Sprintf("/tmp/concrnt/user/%s.log", requester)
+	return c.Attachment(path, requester+".log")
 
-	fmt.Printf("path: %s\n", path)
+}
 
-	return c.Attachment(path, "archive.log")
+func (h *handler) GetSyncStatus(c echo.Context) error {
+	ctx, span := tracer.Start(c.Request().Context(), "Store.Handler.GetSyncStatus")
+	defer span.End()
+
+	requester, ok := ctx.Value(core.RequesterIdCtxKey).(string)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized"})
+	}
+
+	status, err := h.service.SyncStatus(ctx, requester)
+	if err != nil {
+		span.RecordError(err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": status})
+}
+
+func (h *handler) PerformSync(c echo.Context) error {
+	ctx, span := tracer.Start(c.Request().Context(), "Store.Handler.PerformSync")
+	defer span.End()
+
+	requester, ok := ctx.Value(core.RequesterIdCtxKey).(string)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "Unauthorized"})
+	}
+
+	status, err := h.service.SyncCommitFile(ctx, requester)
+	if err != nil {
+		span.RecordError(err)
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": status})
 }
 
 func (h *handler) Post(c echo.Context) error {
@@ -102,8 +140,10 @@ func (h *handler) Post(c echo.Context) error {
 	body := c.Request().Body
 	defer body.Close()
 
+	requesterIP := c.RealIP()
+
 	from := c.QueryParam("from")
-	result, err := h.service.Restore(ctx, body, from)
+	result, err := h.service.Restore(ctx, body, from, requesterIP)
 
 	if err != nil {
 		span.RecordError(err)

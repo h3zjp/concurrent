@@ -130,7 +130,6 @@ type Timeline struct {
 	Indexable    bool      `json:"indexable" gorm:"type:boolean;default:false"`
 	Owner        string    `json:"owner" gorm:"type:char(42)"`
 	Author       string    `json:"author" gorm:"type:char(42)"`
-	DomainOwned  bool      `json:"domainOwned" gorm:"type:boolean;default:false"` // Deprecated
 	SchemaID     uint      `json:"-"`
 	Schema       string    `json:"schema" gorm:"-"`
 	PolicyID     uint      `json:"-"`
@@ -140,6 +139,8 @@ type Timeline struct {
 	Signature    string    `json:"signature" gorm:"type:char(130)"`
 	CDate        time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
 	MDate        time.Time `json:"mdate" gorm:"autoUpdateTime"`
+
+	DomainOwned bool `json:"domainOwned" gorm:"type:boolean;default:false"` // for backward compatibility
 }
 
 // TimelineItem is one of a base object of concurrent
@@ -168,7 +169,6 @@ type Subscription struct {
 	Owner        string             `json:"owner" gorm:"type:char(42)"`
 	Author       string             `json:"author" gorm:"type:char(42);"`
 	Indexable    bool               `json:"indexable" gorm:"type:boolean;default:false"`
-	DomainOwned  bool               `json:"domainOwned" gorm:"type:boolean;default:false"` // Deprecated
 	SchemaID     uint               `json:"-"`
 	Schema       string             `json:"schema" gorm:"-"`
 	PolicyID     uint               `json:"-"`
@@ -179,6 +179,8 @@ type Subscription struct {
 	Items        []SubscriptionItem `json:"items" gorm:"foreignKey:Subscription"`
 	CDate        time.Time          `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
 	MDate        time.Time          `json:"mdate" gorm:"autoUpdateTime"`
+
+	DomainOwned bool `json:"domainOwned" gorm:"type:boolean;default:false"`
 }
 
 type ResolverType uint
@@ -213,4 +215,24 @@ type Job struct {
 	CreatedAt   time.Time `json:"createdAt" gorm:"autoCreateTime"`
 	CompletedAt time.Time `json:"completedAt" gorm:"autoUpdateTime"`
 	TraceID     string    `json:"traceID" gorm:"type:text"`
+}
+
+type CommitOwner struct {
+	ID          uint   `json:"id" gorm:"primaryKey;auto_increment"`
+	CommitLogID uint   `json:"commitLogID" gorm:"index;uniqueIndex:idx_commit_owner"`
+	Owner       string `json:"owner" gorm:"type:char(42);index;uniqueIndex:idx_commit_owner"`
+}
+
+type CommitLog struct {
+	ID           uint          `json:"id" gorm:"primaryKey;auto_increment"`
+	IP           string        `json:"ip" gorm:"type:text"`
+	DocumentID   string        `json:"documentID" gorm:"type:char(26);uniqueIndex:idx_document_id"`
+	IsEphemeral  bool          `json:"isEphemeral" gorm:"type:boolean;default:false"`
+	Type         string        `json:"type" gorm:"type:text"`
+	Document     string        `json:"document" gorm:"type:json"`
+	Signature    string        `json:"signature" gorm:"type:char(130)"`
+	SignedAt     time.Time     `json:"signedAt" gorm:"type:timestamp with time zone;not null;default:clock_timestamp()"`
+	CommitOwners []CommitOwner `json:"commitOwners" gorm:"foreignKey:CommitLogID"`
+	Owners       []string      `json:"owners" gorm:"-"`
+	CDate        time.Time     `json:"cdate" gorm:"type:timestamp with time zone;not null;default:clock_timestamp()"`
 }
