@@ -296,6 +296,58 @@ var globalPolicyJson = `
                 ]
             }
         },
+        "timeline.retract": {
+            "dominant": true,
+            "defaultOnFalse": true,
+            "condition": {
+                "op": "Or",
+                "args": [
+                    {
+                        "op": "Eq",
+                        "args": [
+                            {
+                                "op": "LoadSelf",
+                                "const": "author"
+                            },
+                            {
+                                "op": "LoadDocument",
+                                "const": "signer"
+                            }
+                        ]
+                    },
+                    {
+                        "op": "Eq",
+                        "args": [
+                            {
+                                "op": "LoadResource",
+                                "const": "author"
+                            },
+                            {
+                                "op": "LoadDocument",
+                                "const": "signer"
+                            }
+                        ]
+                    },
+                    {
+                        "op": "Eq",
+                        "args": [
+                            {
+                                "op": "LoadResource",
+                                "const": "owner"
+                            },
+                            {
+                                "op": "LoadDocument",
+                                "const": "signer"
+                            }
+                        ]
+                    },
+                    {
+                        "op": "RequesterHasTag",
+                        "const": "_admin"
+                    }
+                ]
+            }
+        },
         "timeline.message.read": {
             "condition": {
                 "op": "Or",
@@ -330,6 +382,7 @@ var globalPolicyJson = `
         }
     },
     "defaults": {
+        "timeline.message.read": true,
         "message.association.attach": true,
         "timeline.association.attach": true,
         "subscription.association.attach": true

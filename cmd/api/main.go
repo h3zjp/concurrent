@@ -69,10 +69,10 @@ func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 var (
-	version      = "v1.4.1"
+	version      = "v1.5.0"
 	buildMachine = "AlmaLinux release 9.3 (Shamrock Pampas Cat)"
-	buildTime    = "Tue Oct 15 08:07:20 UTC 2024"
-	goVersion    = "go1.22.5 linux/amd64"
+	buildTime    = "Tue Oct 22 06:16:00 UTC 2024"
+	goVersion    = "go1.22.4 linux/amd64"
 )
 
 func main() {
@@ -338,6 +338,7 @@ func main() {
 	apiV1.GET("/timelines/recent", timelineHandler.Recent)
 	apiV1.GET("/timelines/range", timelineHandler.Range)
 	apiV1.GET("/timelines/chunks", timelineHandler.GetChunks)
+	apiV1.GET("/timelines/retracted", timelineHandler.Retracted)
 	apiV1.GET("/timelines/realtime", timelineHandler.Realtime)
 
 	// chunk

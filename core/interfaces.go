@@ -38,6 +38,7 @@ type AssociationService interface {
 type AuthService interface {
 	IssuePassport(ctx context.Context, requester string, key []Key) (string, error)
 	IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc
+	RateLimiter(configMap RateLimitConfigMap) echo.MiddlewareFunc
 }
 
 type DomainService interface {
@@ -94,7 +95,8 @@ type PolicyService interface {
 	Test(ctx context.Context, policy Policy, context RequestContext, action string) (PolicyEvalResult, error)
 	TestWithPolicyURL(ctx context.Context, url string, context RequestContext, action string) (PolicyEvalResult, error)
 	TestWithGlobalPolicy(ctx context.Context, context RequestContext, action string) (PolicyEvalResult, error)
-	Summerize(results []PolicyEvalResult, action string) bool
+	Summerize(results []PolicyEvalResult, action string, overrides *map[string]bool) bool
+	AccumulateOr(results []PolicyEvalResult, action string, override *map[string]bool) PolicyEvalResult
 }
 
 type ProfileService interface {
@@ -183,6 +185,8 @@ type TimelineService interface {
 	GetOwners(ctx context.Context, timelines []string) ([]string, error)
 
 	Query(ctx context.Context, timelineID, schema, owner, author string, until time.Time, limit int) ([]TimelineItem, error)
+
+	ListLocalRecentlyRemovedItems(ctx context.Context, timelines []string) (map[string][]string, error)
 
 	Realtime(ctx context.Context, request <-chan []string, response chan<- Event)
 

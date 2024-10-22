@@ -245,7 +245,9 @@ func main() {
 
 		proxy.Transport = otelhttp.NewTransport(http.DefaultTransport)
 
-		middlewares := []echo.MiddlewareFunc{}
+		middlewares := []echo.MiddlewareFunc{
+			authService.RateLimiter(service.RateLimitConf),
+		}
 		if service.InjectCors {
 			middlewares = append(middlewares, cors)
 		}
@@ -325,7 +327,7 @@ func main() {
 		You might looking for <a href="https://concrnt.world/">concrnt.world (v1)</a>.<br>
 		This domain is currently registration: `+config.Concrnt.Registration+`<br>
 		<h2>Information</h2>
-		CDID: `+conconf.CCID+`
+		CSID: `+conconf.CSID+`
 		<h2>Services</h2>
 		<ul>
 		`+func() string {

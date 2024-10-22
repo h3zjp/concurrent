@@ -55,6 +55,9 @@ type Repository interface {
 	LookupChunkItrs(ctx context.Context, timelines []string, epoch string) (map[string]string, error)
 	LoadChunkBodies(ctx context.Context, query map[string]string) (map[string]core.Chunk, error)
 
+	ListRecentlyRemovedItems(ctx context.Context, normalized []string) (map[string][]string, error)
+	ListRecentlyRemovedItemsLocal(ctx context.Context, timelineIDs []string) (map[string][]string, error)
+
 	GetMetrics() map[string]int64
 }
 
@@ -621,22 +624,12 @@ func (r *repository) PublishEvent(ctx context.Context, event core.Event) error {
 	return nil
 }
 
-// GetTimelineFromRemote gets a timeline from remote
-func (r *repository) GetTimelineFromRemote(ctx context.Context, host string, key string) (core.Timeline, error) {
-	ctx, span := tracer.Start(ctx, "Timeline.Repository.GetTimelineFromRemote")
+func (r *repository) getTimelineFromRemote(ctx context.Context, host, key string) (core.Timeline, error) {
+	ctx, span := tracer.Start(ctx, "Timeline.Repository.getTimelineFromRemote")
 	defer span.End()
 
-	// check cache
-	cacheKey := "timeline:" + key + "@" + host
-	item, err := r.mc.Get(cacheKey)
-	if err == nil {
-		var timeline core.Timeline
-		err = json.Unmarshal(item.Value, &timeline)
-		if err == nil {
-			return timeline, nil
-		}
-		span.RecordError(err)
-	}
+	cacheKey := "tl:data:" + key + "@" + host
+	freshKey := "tl:fresh:" + key + "@" + host
 
 	timeline, err := r.client.GetTimeline(ctx, host, key, nil)
 	if err != nil {
@@ -645,28 +638,72 @@ func (r *repository) GetTimelineFromRemote(ctx context.Context, host string, key
 	}
 
 	// save to cache
-	body, err := json.Marshal(timeline)
-	if err != nil {
-		span.RecordError(err)
-		slog.ErrorContext(
-			ctx, "fail to marshal timeline",
-			slog.String("error", err.Error()),
-			slog.String("module", "timeline"),
-		)
-		return core.Timeline{}, err
+	go func() {
+		body, err := json.Marshal(timeline)
+		if err != nil {
+			span.RecordError(err)
+			slog.ErrorContext(
+				ctx, "fail to marshal timeline",
+				slog.String("error", err.Error()),
+				slog.String("module", "timeline"),
+			)
+			return
+		}
+
+		err = r.mc.Set(&memcache.Item{Key: cacheKey, Value: body, Expiration: 60 * 60 * 24 * 7}) // 7 days
+		if err != nil {
+			span.RecordError(err)
+			slog.ErrorContext(
+				ctx, "fail to save cache",
+				slog.String("error", err.Error()),
+				slog.String("module", "timeline"),
+			)
+		}
+		err = r.mc.Set(&memcache.Item{Key: freshKey, Value: []byte("1"), Expiration: 300}) // 5 minutes
+		if err != nil {
+			span.RecordError(err)
+			slog.ErrorContext(
+				ctx, "fail to save cache",
+				slog.String("error", err.Error()),
+				slog.String("module", "timeline"),
+			)
+		}
+	}()
+
+	return timeline, err
+}
+
+// GetTimelineFromRemote gets a timeline from remote
+func (r *repository) GetTimelineFromRemote(ctx context.Context, host string, key string) (core.Timeline, error) {
+	ctx, span := tracer.Start(ctx, "Timeline.Repository.GetTimelineFromRemote")
+	defer span.End()
+
+	var timeline *core.Timeline
+
+	// check cache
+	cacheKey := "tl:data:" + key + "@" + host
+	freshKey := "tl:fresh:" + key + "@" + host
+	item, err := r.mc.Get(cacheKey)
+	if err == nil {
+		err = json.Unmarshal(item.Value, &timeline)
+		if err != nil {
+			span.RecordError(err)
+		}
 	}
 
-	err = r.mc.Set(&memcache.Item{Key: cacheKey, Value: body, Expiration: 300}) // 5 minutes
-	if err != nil {
-		span.RecordError(err)
-		slog.ErrorContext(
-			ctx, "fail to save cache",
-			slog.String("error", err.Error()),
-			slog.String("module", "timeline"),
-		)
+	if timeline == nil {
+		return r.getTimelineFromRemote(ctx, host, key)
 	}
 
-	return timeline, nil
+	// revalidate cache in background
+	_, err = r.mc.Get(freshKey)
+	if err != nil && errors.Is(err, memcache.ErrCacheMiss) {
+		go func() {
+			r.getTimelineFromRemote(ctx, host, key)
+		}()
+	}
+
+	return *timeline, nil
 }
 
 // GetItem returns a timeline item by TimelineID and ObjectID
@@ -674,8 +711,13 @@ func (r *repository) GetItem(ctx context.Context, timelineID string, objectID st
 	ctx, span := tracer.Start(ctx, "Timeline.Repository.GetItem")
 	defer span.End()
 
+	timelineID, err := r.normalizeLocalDBID(timelineID)
+	if err != nil {
+		return core.TimelineItem{}, err
+	}
+
 	var item core.TimelineItem
-	err := r.db.WithContext(ctx).First(&item, "timeline_id = ? and resource_id = ?", timelineID, objectID).Error
+	err = r.db.WithContext(ctx).First(&item, "timeline_id = ? and resource_id = ?", timelineID, objectID).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return core.TimelineItem{}, core.NewErrorNotFound()
@@ -750,6 +792,14 @@ func (r *repository) DeleteItem(ctx context.Context, timelineID string, objectID
 	ctx, span := tracer.Start(ctx, "Timeline.Repository.DeleteItem")
 	defer span.End()
 
+	timelineID, err := r.normalizeLocalDBID(timelineID)
+	if err != nil {
+		return err
+	}
+
+	r.rdb.SAdd(ctx, "timeline:"+timelineID+":deleted", objectID)
+	r.rdb.Expire(ctx, "timeline:"+timelineID+":deleted", time.Hour*24*2) // 2 days
+
 	return r.db.WithContext(ctx).Delete(&core.TimelineItem{}, "timeline_id = ? and resource_id = ?", timelineID, objectID).Error
 }
 
@@ -757,7 +807,154 @@ func (r *repository) DeleteItemByResourceID(ctx context.Context, resourceID stri
 	ctx, span := tracer.Start(ctx, "Timeline.Repository.DeleteItemByResourceID")
 	defer span.End()
 
+	var items []core.TimelineItem
+	err := r.db.WithContext(ctx).Where("resource_id = ?", resourceID).Find(&items).Error
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		r.rdb.SAdd(ctx, "timeline:"+item.TimelineID+":deleted", item.ResourceID)
+		r.rdb.Expire(ctx, "timeline:"+item.TimelineID+":deleted", time.Hour*24*2) // 2 days
+	}
+
 	return r.db.WithContext(ctx).Delete(&core.TimelineItem{}, "resource_id = ?", resourceID).Error
+}
+
+func (r *repository) ListRecentlyRemovedItems(ctx context.Context, normalized []string) (map[string][]string, error) {
+	ctx, span := tracer.Start(ctx, "Timeline.Repository.ListRecentlyRemovedItems")
+	defer span.End()
+
+	var domainMap = make(map[string][]string)
+	for _, timeline := range normalized {
+		split := strings.Split(timeline, "@")
+		domain := split[len(split)-1]
+		if len(split) >= 2 {
+			if _, ok := domainMap[domain]; !ok {
+				domainMap[domain] = make([]string, 0)
+			}
+			domainMap[domain] = append(domainMap[domain], timeline)
+		}
+	}
+
+	result := make(map[string][]string)
+	for domain, timelines := range domainMap {
+		if domain == r.config.FQDN {
+			local, err := r.ListRecentlyRemovedItemsLocal(ctx, timelines)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range local {
+				result[k] = v
+			}
+		} else {
+			remote, err := r.ListRecentlyRemovedItemsRemote(ctx, domain, timelines)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range remote {
+				result[k] = v
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func (r *repository) ListRecentlyRemovedItemsLocal(ctx context.Context, timelineIDs []string) (map[string][]string, error) {
+	ctx, span := tracer.Start(ctx, "Timeline.Repository.ListRecentlyRemovedItemsLocal")
+	defer span.End()
+
+	var removedItems = make(map[string][]string)
+	for _, timelineID := range timelineIDs {
+
+		normalized, err := r.normalizeLocalDBID(timelineID)
+		if err != nil {
+			continue
+		}
+
+		deleted, err := r.rdb.SMembers(ctx, "timeline:"+normalized+":deleted").Result()
+		if err != nil {
+			return nil, err
+		}
+		removedItems[timelineID] = deleted
+	}
+
+	return removedItems, nil
+}
+
+func (r *repository) ListRecentlyRemovedItemsRemote(ctx context.Context, domain string, timelineIDs []string) (map[string][]string, error) {
+	ctx, span := tracer.Start(ctx, "Timeline.Repository.ListRecentlyRemovedItemsRemote")
+	defer span.End()
+
+	// get from cache
+	cacheKeys := make([]string, len(timelineIDs))
+	cacheMap := make(map[string]string)
+	for i, timelineID := range timelineIDs {
+		key := "tl:retracted:data:" + domain + ":" + timelineID
+		cacheKeys[i] = key
+		cacheMap[key] = timelineID
+	}
+
+	cache, err := r.mc.GetMulti(cacheKeys)
+	if err != nil {
+		span.RecordError(err)
+	}
+
+	var result = map[string][]string{}
+	for _, key := range cacheKeys {
+		timelineID := cacheMap[key]
+		value, ok := cache[key]
+		if ok {
+			result[timelineID] = strings.Split(string(value.Value), ",")
+		} else {
+			result[timelineID] = []string{}
+		}
+	}
+
+	// create cache in background
+	go func() {
+		freshKeys := make([]string, len(timelineIDs))
+		freshMap := make(map[string]string)
+		for i, timelineID := range timelineIDs {
+			key := "tl:retracted:fresh:" + domain + ":" + timelineID
+			freshKeys[i] = key
+			freshMap[key] = timelineID
+		}
+
+		fresh, err := r.mc.GetMulti(freshKeys)
+		if err != nil {
+			span.RecordError(err)
+		}
+
+		targets := []string{}
+
+		for _, key := range freshKeys {
+			timelineID := freshMap[key]
+			_, ok := fresh[key]
+			if ok {
+				continue
+			}
+			targets = append(targets, timelineID)
+		}
+
+		cache, err := r.client.GetRetracted(ctx, domain, targets, nil)
+		if err != nil {
+			span.RecordError(err)
+			return
+		}
+
+		for timelineID, retracted := range cache {
+			datakey := "tl:retracted:data:" + domain + ":" + timelineID
+			value := strings.Join(retracted, ",")
+			r.mc.Set(&memcache.Item{Key: datakey, Value: []byte(value), Expiration: 60 * 60 * 24 * 2})
+
+			freshkey := "tl:retracted:fresh:" + domain + ":" + timelineID
+			r.mc.Set(&memcache.Item{Key: freshkey, Value: []byte("1"), Expiration: 60}) // 1 minute
+		}
+	}()
+
+	return result, nil
 }
 
 // GetTimelineRecent returns a list of timeline items by TimelineID and time range
