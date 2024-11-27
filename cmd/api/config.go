@@ -14,15 +14,17 @@ type Config struct {
 }
 
 type Server struct {
-	Dsn            string `yaml:"dsn"`
-	RedisAddr      string `yaml:"redisAddr"`
-	RedisDB        int    `yaml:"redisDB"`
-	MemcachedAddr  string `yaml:"memcachedAddr"`
-	EnableTrace    bool   `yaml:"enableTrace"`
-	TraceEndpoint  string `yaml:"traceEndpoint"`
-	RepositoryPath string `yaml:"repositoryPath"`
-	CaptchaSitekey string `yaml:"captchaSitekey"`
-	CaptchaSecret  string `yaml:"captchaSecret"`
+	Dsn             string `yaml:"dsn"`
+	RedisAddr       string `yaml:"redisAddr"`
+	RedisDB         int    `yaml:"redisDB"`
+	MemcachedAddr   string `yaml:"memcachedAddr"`
+	EnableTrace     bool   `yaml:"enableTrace"`
+	TraceEndpoint   string `yaml:"traceEndpoint"`
+	RepositoryPath  string `yaml:"repositoryPath"`
+	CaptchaSitekey  string `yaml:"captchaSitekey"`
+	CaptchaSecret   string `yaml:"captchaSecret"`
+	VapidPublicKey  string `yaml:"vapidPublicKey"`
+	VapidPrivateKey string `yaml:"vapidPrivateKey"`
 }
 
 type BuildInfo struct {
@@ -45,6 +47,7 @@ type Profile struct {
 	Version      string    `yaml:"version" json:"version"`
 	BuildInfo    BuildInfo `yaml:"buildInfo" json:"buildInfo"`
 	SiteKey      string    `yaml:"captchaSiteKey" json:"captchaSiteKey"`
+	VapidKey     string    `yaml:"vapidKey" json:"vapidKey"`
 }
 
 // Load loads config from given path

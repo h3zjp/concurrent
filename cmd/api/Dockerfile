@@ -1,4 +1,4 @@
-FROM golang:1.22.5 AS coreBuilder
+FROM golang:1.22.5 AS builder
 WORKDIR /work
 
 ARG VERSION
@@ -7,7 +7,7 @@ COPY ./go.mod ./go.sum ./
 RUN go mod download && go mod verify
 COPY ./ ./
 
-RUN go install github.com/concrnt/conctl@v0.0.3
+RUN go install github.com/concrnt/conctl@v1.0.1
 
 RUN VERSION=${VERSION:-$(git describe)} \
  && BUILD_MACHINE=$(uname -srmo) \
@@ -18,7 +18,7 @@ RUN VERSION=${VERSION:-$(git describe)} \
 FROM ubuntu:latest
 RUN apt-get update && apt-get install -y ca-certificates curl --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
-COPY --from=coreBuilder /work/ccapi /usr/local/bin
-COPY --from=coreBuilder /go/bin/conctl /usr/local/bin
+COPY --from=builder /work/ccapi /usr/local/bin
+COPY --from=builder /go/bin/conctl /usr/local/bin
 
 CMD ["ccapi"]

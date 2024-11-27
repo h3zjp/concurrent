@@ -40,15 +40,14 @@ services:
       - external
       - internal
 
-  summary:
-    image: ghcr.io/rassi0429/url-summary:latest
+  hyperproxy:
+    image: ghcr.io/concrnt/hyperproxy:latest
     restart: always
-    environment:
-      - PORT=8080
     expose:
       - 8080
     networks:
       - external
+      - internal
 
 # apbridge:
 #   image: ghcr.io/concrnt/ccworld-ap-bridge:latest

@@ -20,6 +20,7 @@ import (
 	"github.com/totegamma/concurrent/x/jwt"
 	"github.com/totegamma/concurrent/x/key"
 	"github.com/totegamma/concurrent/x/message"
+	"github.com/totegamma/concurrent/x/notification"
 	"github.com/totegamma/concurrent/x/policy"
 	"github.com/totegamma/concurrent/x/profile"
 	"github.com/totegamma/concurrent/x/schema"
@@ -71,6 +72,12 @@ var storeServiceProvider = wire.NewSet(
 	SetupAckService,
 	SetupSubscriptionService,
 	SetupSemanticidService,
+)
+
+// other
+var notificationServiceProvider = wire.NewSet(
+	notification.NewService,
+	notification.NewRepository,
 )
 
 // -----------
@@ -157,5 +164,10 @@ func SetupSubscriptionService(db *gorm.DB, rdb *redis.Client, mc *memcache.Clien
 
 func SetupSemanticidService(db *gorm.DB) core.SemanticIDService {
 	wire.Build(semanticidServiceProvider)
+	return nil
+}
+
+func SetupNotificationService(db *gorm.DB) core.NotificationService {
+	wire.Build(notificationServiceProvider)
 	return nil
 }

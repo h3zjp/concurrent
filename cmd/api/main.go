@@ -30,14 +30,15 @@ import (
 	"github.com/totegamma/concurrent/x/job"
 	"github.com/totegamma/concurrent/x/key"
 	"github.com/totegamma/concurrent/x/message"
+	"github.com/totegamma/concurrent/x/notification"
 	"github.com/totegamma/concurrent/x/profile"
 	"github.com/totegamma/concurrent/x/store"
 	"github.com/totegamma/concurrent/x/subscription"
 	"github.com/totegamma/concurrent/x/timeline"
 	"github.com/totegamma/concurrent/x/userkv"
 
+	"github.com/SherClockHolmes/webpush-go"
 	"github.com/bradfitz/gomemcache/memcache"
-
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 	"go.opentelemetry.io/otel"
@@ -186,15 +187,12 @@ func main() {
 		&core.Job{},
 		&core.CommitLog{},
 		&core.CommitOwner{},
+		&core.NotificationSubscription{},
 	)
 
 	if err != nil {
 		panic("failed to migrate schema: " + err.Error())
 	}
-
-	// migration from 1.3.2 to 1.3.3
-	db.Model(&core.Timeline{}).Where("owner IS NULL or domain_owned = true").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
-	db.Model(&core.Subscription{}).Where("owner IS NULL or domain_owned = true").Update("owner", gorm.Expr("CASE WHEN domain_owned THEN ? ELSE author END", conconf.CSID))
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     config.Server.RedisAddr,
@@ -264,21 +262,16 @@ func main() {
 	jobHandler := job.NewHandler(jobService)
 	jobReactor := job.NewReactor(storeService, jobService)
 
-	// migration from 1.3.2 to 1.3.3
-	var remotes []core.Domain
-	db.Find(&remotes)
-	for _, remote := range remotes {
-		go func(remote core.Domain) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			msg := "succeed"
-			_, err := domainService.ForceFetch(ctx, remote.ID)
-			if err != nil {
-				msg = err.Error()
-			}
-			fmt.Println("force fetch", remote.ID, msg)
-		}(remote)
+	webpushOpts := webpush.Options{
+		Subscriber:      "webmaster@" + config.Concrnt.FQDN,
+		VAPIDPublicKey:  config.Server.VapidPublicKey,
+		VAPIDPrivateKey: config.Server.VapidPrivateKey,
+		TTL:             60,
 	}
+
+	notificationService := concurrent.SetupNotificationService(db)
+	notificationHandler := notification.NewHandler(notificationService)
+	notificationReactor := notification.NewReactor(notificationService, timelineService, webpushOpts)
 
 	apiV1 := e.Group("", auth.ReceiveGatewayAuthPropagation)
 	// store
@@ -295,6 +288,7 @@ func main() {
 			GoVersion:    goVersion,
 		}
 		meta.SiteKey = config.Server.CaptchaSitekey
+		meta.VapidKey = config.Server.VapidPublicKey
 
 		return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": core.Domain{
 			ID:        conconf.FQDN,
@@ -371,6 +365,11 @@ func main() {
 	apiV1.GET("/jobs", jobHandler.List, auth.Restrict(auth.ISREGISTERED))
 	apiV1.POST("/jobs", jobHandler.Create, auth.Restrict(auth.ISREGISTERED))
 	apiV1.DELETE("/job/:id", jobHandler.Cancel, auth.Restrict(auth.ISREGISTERED))
+
+	// notification
+	apiV1.POST("/notification", notificationHandler.Subscribe, auth.Restrict(auth.ISREGISTERED))
+	apiV1.DELETE("/notification/:owner/:vendor_id", notificationHandler.Delete, auth.Restrict(auth.ISREGISTERED))
+	apiV1.GET("/notification/:owner/:vendor_id", notificationHandler.Get, auth.Restrict(auth.ISREGISTERED))
 
 	// misc
 	e.GET("/health", func(c echo.Context) (err error) {
@@ -464,6 +463,7 @@ func main() {
 
 	timelineKeeper.Start(context.Background())
 	jobReactor.Start(context.Background())
+	notificationReactor.Start(context.Background())
 
 	port := "192.168.10.14:8010"
 	envport := os.Getenv("CC_API_PORT")

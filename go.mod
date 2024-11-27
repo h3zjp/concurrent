@@ -3,6 +3,7 @@ module github.com/totegamma/concurrent
 go 1.22.4
 
 require (
+	github.com/SherClockHolmes/webpush-go v1.3.0
 	github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874
 	github.com/cosmos/cosmos-sdk v0.50.7
 	github.com/ethereum/go-ethereum v1.14.5

@@ -382,7 +382,7 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 		delete(remoteConns, domain)
 		return
 	}
-	slog.Info(
+	slog.Debug(
 		fmt.Sprintf("remote connection updated: %s > %s", domain, timelines),
 		slog.String("module", "agent"),
 		slog.String("group", "realtime"),
@@ -474,7 +474,7 @@ func (k *keeper) watchEventRoutine(ctx context.Context) {
 				continue
 			}
 
-			slog.Info(
+			slog.Debug(
 				fmt.Sprintf("received message: %s", msg.Payload),
 				slog.String("module", "agent"),
 				slog.String("group", "realtime"),

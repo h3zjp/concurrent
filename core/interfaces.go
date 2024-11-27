@@ -200,3 +200,10 @@ type JobService interface {
 	Complete(ctx context.Context, id, status, result string) (Job, error)
 	Cancel(ctx context.Context, id string) (Job, error)
 }
+
+type NotificationService interface {
+	Subscribe(ctx context.Context, notification NotificationSubscription) (NotificationSubscription, error)
+	GetAllSubscriptions(ctx context.Context) ([]NotificationSubscription, error)
+	Delete(ctx context.Context, vendorID, owner string) error
+	Get(ctx context.Context, vendorID, owner string) (NotificationSubscription, error)
+}

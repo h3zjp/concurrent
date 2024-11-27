@@ -181,33 +181,39 @@ func (s *service) Affiliation(ctx context.Context, mode core.CommitMode, documen
 				return core.Entity{}, fmt.Errorf("token is already used")
 			}
 
-			inviterccid := claims.Issuer
-			if core.IsCKID(inviterccid) {
-				inviterccid, err = s.key.ResolveSubkey(ctx, inviterccid)
+			inviterID := claims.Issuer
+			if core.IsCKID(inviterID) {
+				inviterID, err = s.key.ResolveSubkey(ctx, inviterID)
 				if err != nil {
 					span.RecordError(err)
 					return core.Entity{}, err
 				}
 			}
 
-			inviter, err := s.repository.Get(ctx, inviterccid)
-			if err != nil {
-				span.RecordError(err)
-				return core.Entity{}, err
-			}
+			if core.IsCSID(inviterID) {
+				if inviterID != s.config.CSID {
+					return core.Entity{}, fmt.Errorf("inviter is not allowed to invite")
+				}
+			} else {
+				inviter, err := s.repository.Get(ctx, inviterID)
+				if err != nil {
+					span.RecordError(err)
+					return core.Entity{}, err
+				}
 
-			rctx := core.RequestContext{
-				Requester: inviter,
-			}
+				rctx := core.RequestContext{
+					Requester: inviter,
+				}
 
-			policyResult, err := s.policy.TestWithGlobalPolicy(ctx, rctx, "invite")
-			if err != nil {
-				span.RecordError(err)
-				return core.Entity{}, err
-			}
+				policyResult, err := s.policy.TestWithGlobalPolicy(ctx, rctx, "invite")
+				if err != nil {
+					span.RecordError(err)
+					return core.Entity{}, err
+				}
 
-			if policyResult == core.PolicyEvalResultNever || policyResult == core.PolicyEvalResultDeny {
-				return core.Entity{}, fmt.Errorf("inviter is not allowed to invite")
+				if policyResult == core.PolicyEvalResultNever || policyResult == core.PolicyEvalResultDeny {
+					return core.Entity{}, fmt.Errorf("inviter is not allowed to invite")
+				}
 			}
 
 			registered, _, err := s.repository.UpsertWithMeta(
