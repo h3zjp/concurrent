@@ -87,7 +87,7 @@ func (h handler) Query(c echo.Context) error {
 	sinceStr := c.QueryParam("since")
 	untilStr := c.QueryParam("until")
 
-	since := time.Now()
+	since := time.Time{}
 	if sinceStr != "" {
 		epoch, err := strconv.ParseInt(sinceStr, 10, 64)
 		if err != nil {
@@ -97,7 +97,7 @@ func (h handler) Query(c echo.Context) error {
 		since = time.Unix(epoch, 0)
 	}
 
-	until := time.Now()
+	until := time.Time{}
 	var err error
 	if untilStr != "" {
 		epoch, err := strconv.ParseInt(untilStr, 10, 64)
