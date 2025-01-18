@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/totegamma/concurrent/cdid"
 	"github.com/totegamma/concurrent/core"
@@ -284,4 +285,11 @@ func (s *service) Clean(ctx context.Context, ccid string) error {
 	defer span.End()
 
 	return s.repo.Clean(ctx, ccid)
+}
+
+func (s *service) Query(ctx context.Context, author, schema string, limit int, until time.Time) ([]core.Profile, error) {
+	ctx, span := tracer.Start(ctx, "Profile.Service.Query")
+	defer span.End()
+
+	return s.repo.Query(ctx, author, schema, limit, until)
 }

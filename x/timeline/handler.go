@@ -265,11 +265,11 @@ func (h handler) Query(c echo.Context) error {
 	var err error
 	if untilStr != "" {
 		epoch, err := strconv.ParseInt(untilStr, 10, 64)
-		until = time.Unix(epoch, 0)
 		if err != nil {
 			span.RecordError(err)
 			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request"})
 		}
+		until = time.Unix(epoch, 0)
 	}
 
 	limit := 16
