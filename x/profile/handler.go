@@ -84,7 +84,18 @@ func (h handler) Query(c echo.Context) error {
 	author := c.QueryParam("author")
 	schema := c.QueryParam("schema")
 	limitStr := c.QueryParam("limit")
+	sinceStr := c.QueryParam("since")
 	untilStr := c.QueryParam("until")
+
+	since := time.Now()
+	if sinceStr != "" {
+		epoch, err := strconv.ParseInt(sinceStr, 10, 64)
+		if err != nil {
+			span.RecordError(err)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request"})
+		}
+		since = time.Unix(epoch, 0)
+	}
 
 	until := time.Now()
 	var err error
@@ -110,7 +121,7 @@ func (h handler) Query(c echo.Context) error {
 		limit = 100
 	}
 
-	profiles, err := h.service.Query(ctx, author, schema, limit, until)
+	profiles, err := h.service.Query(ctx, author, schema, limit, since, until)
 
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})

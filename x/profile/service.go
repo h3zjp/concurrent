@@ -287,9 +287,9 @@ func (s *service) Clean(ctx context.Context, ccid string) error {
 	return s.repo.Clean(ctx, ccid)
 }
 
-func (s *service) Query(ctx context.Context, author, schema string, limit int, until time.Time) ([]core.Profile, error) {
+func (s *service) Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]core.Profile, error) {
 	ctx, span := tracer.Start(ctx, "Profile.Service.Query")
 	defer span.End()
 
-	return s.repo.Query(ctx, author, schema, limit, until)
+	return s.repo.Query(ctx, author, schema, limit, since, until)
 }

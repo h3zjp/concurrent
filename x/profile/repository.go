@@ -3,6 +3,7 @@ package profile
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strconv"
 	"time"
 
@@ -23,7 +24,7 @@ type Repository interface {
 	Delete(ctx context.Context, id string) (core.Profile, error)
 	Clean(ctx context.Context, ccid string) error
 	Count(ctx context.Context) (int64, error)
-	Query(ctx context.Context, author, schema string, limit int, until time.Time) ([]core.Profile, error)
+	Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]core.Profile, error)
 }
 
 type repository struct {
@@ -311,7 +312,7 @@ func (r *repository) Clean(ctx context.Context, ccid string) error {
 	return nil
 }
 
-func (r *repository) Query(ctx context.Context, author, schema string, limit int, until time.Time) ([]core.Profile, error) {
+func (r *repository) Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]core.Profile, error) {
 	ctx, span := tracer.Start(ctx, "Profile.Repository.Query")
 	defer span.End()
 
@@ -330,17 +331,17 @@ func (r *repository) Query(ctx context.Context, author, schema string, limit int
 		query = query.Where("schema_id = ?", schemaID)
 	}
 
-	if !until.IsZero() {
-		query = query.Where("c_date < ?", until)
+	var err error
+	if !since.IsZero() {
+		err = query.Where("c_date > ?", since).Order("c_date asc").Limit(limit).Find(&profiles).Error
+		slices.Reverse(profiles)
+	} else if !until.IsZero() {
+		err = query.Where("c_date < ?", until).Order("c_date desc").Limit(limit).Find(&profiles).Error
+	} else {
+		err = query.Order("c_date desc").Limit(limit).Find(&profiles).Error
 	}
 
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
-
-	query = query.Order("c_date DESC")
-
-	if err := query.Find(&profiles).Error; err != nil {
+	if err != nil {
 		return []core.Profile{}, err
 	}
 
