@@ -148,7 +148,12 @@ func (s service) TestWithPolicyURL(ctx context.Context, url string, context core
 		policy, err = s.repository.Get(ctx, url)
 		if err != nil {
 			span.SetStatus(codes.Error, err.Error())
-			return core.PolicyEvalResultDefault, err
+			globalResult, err := s.test(ctx, s.global, context, action)
+			if err != nil {
+				span.SetStatus(codes.Error, err.Error())
+				return core.PolicyEvalResultDefault, err
+			}
+			return globalResult, nil
 		}
 	}
 
