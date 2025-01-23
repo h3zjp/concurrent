@@ -1,7 +1,8 @@
 concurrent
 _composeData
 _etc
-
 *.exe
 *.log
 .idea/
+cmd/api/api
+cmd/gateway/gateway
