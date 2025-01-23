@@ -472,6 +472,13 @@ func (s *service) PostItem(ctx context.Context, timeline string, item core.Timel
 		author = *item.Author
 	}
 
+	var doc core.DocumentBase[any]
+	err := json.Unmarshal([]byte(document), &doc)
+	if err != nil {
+		span.RecordError(err)
+		// ignore error at this point
+	}
+
 	if timelineHost != s.config.FQDN {
 		span.RecordError(fmt.Errorf("Remote timeline is not supported"))
 		return core.TimelineItem{}, fmt.Errorf("Program error: remote timeline is not supported")
@@ -501,6 +508,7 @@ func (s *service) PostItem(ctx context.Context, timeline string, item core.Timel
 			Self:      tl,
 			Requester: requesterEntity,
 			Params:    params,
+			Document:  doc,
 		},
 		"timeline.distribute",
 	)

@@ -1,10 +1,14 @@
 
 apConfig:
   fqdn: example.com
+  # 通常通り、concrnt.worldでアカウントを作成し、そのアカウントの秘密鍵を入力します。
+  # **APIサーバーの秘密鍵を使いまわさないように！！！**
+  # 途中で変更すると、タイムラインの権限周りを全て修正する必要があるので注意！
   proxyPriv: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# config.yamlと同じ内容
+# config.yamlとほぼ同じ内容
 server:
+  apiAddr: "gateway"
   dsn: "host=db user=postgres password=postgres dbname=concurrent port=5432 sslmode=disable"
   redisAddr: "redis:6379"
   redisDB: 0

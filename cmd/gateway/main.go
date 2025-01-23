@@ -211,6 +211,7 @@ func main() {
 	defer mc.Close()
 
 	client := client.NewClient()
+	client.SetUserAgent("CCGateway", version)
 	globalPolicy := concurrent.GetDefaultGlobalPolicy()
 	policy := concurrent.SetupPolicyService(rdb, globalPolicy, conconf)
 	authService := concurrent.SetupAuthService(db, rdb, mc, client, policy, conconf)
@@ -226,6 +227,17 @@ func main() {
 	// プロキシ設定
 	for _, service := range gwConf.Services {
 		service := service
+
+		if service.Gone {
+			e.Any(service.Path, func(c echo.Context) error {
+				return c.NoContent(http.StatusGone)
+			})
+			e.Any(service.Path+"/*", func(c echo.Context) error {
+				return c.NoContent(http.StatusGone)
+			})
+			continue
+		}
+
 		targetUrl, err := url.Parse("http://" + service.Host + ":" + strconv.Itoa(service.Port))
 		if err != nil {
 			panic(err)

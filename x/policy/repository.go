@@ -61,8 +61,9 @@ func (r *repository) Get(ctx context.Context, url string) (core.Policy, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 		span.SetStatus(codes.Error, err.Error())
-		return core.Policy{}, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return core.Policy{}, err
 	}
 
 	jsonStr, err := io.ReadAll(resp.Body)

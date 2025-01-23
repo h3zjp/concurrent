@@ -216,6 +216,7 @@ func main() {
 	defer mc.Close()
 
 	client := client.NewClient()
+	client.SetUserAgent("CCAPI", version)
 	timelineKeeper := timeline.NewKeeper(rdb, mc, client, conconf)
 
 	globalPolicy := concurrent.GetDefaultGlobalPolicy()

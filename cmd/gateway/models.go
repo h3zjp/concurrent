@@ -24,6 +24,7 @@ type Service struct {
 	PreservePath  bool                    `yaml:"preservePath"`
 	InjectCors    bool                    `yaml:"injectCors"`
 	RateLimitConf core.RateLimitConfigMap `yaml:"rateLimit"`
+	Gone          bool                    `yaml:"gone"`
 }
 
 // Load loads concurrent config from given path

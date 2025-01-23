@@ -6,21 +6,26 @@ server:
   memcachedAddr: "memcached:11211"
   traceEndpoint: "tempo:4318"
   enableTrace: false
-  repositoryPath: "/var/lib/concurrent"
+  # Google reCAPTCHA: https://www.google.com/recaptcha/about/
+  # use v2 checkbox type. here is example keys for testing.
   captchaSitekey: "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI"
   captchaSecret: "6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe"
+  # push notification key. you can generate with conctl command. `conctl gen vapid`
+  vapidPublicKey: ""
+  vapidPrivateKey: ""
 
 concrnt:
   # fqdn is instance ID
   # It is really hard and not recommended to change this value after node started
   fqdn: example.tld
   # 'open' or 'invite' or 'close'
+  # you can generate invite code with conctl command. `conctl gen invite`
   registration: open
   # network
   # for testing: concrnt-devnet, for production: concrnt-mainnet
   dimension: concrnt-mainnet
   # server agent account
-  # it is handy to generate these info with concurrent.world devtool
+  # you can generate with conctl command. `conctl gen identity`
   privatekey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 profile:

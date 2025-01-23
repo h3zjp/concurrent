@@ -4,6 +4,8 @@ package profile
 import (
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"go.opentelemetry.io/otel"
@@ -81,19 +83,45 @@ func (h handler) Query(c echo.Context) error {
 
 	author := c.QueryParam("author")
 	schema := c.QueryParam("schema")
+	limitStr := c.QueryParam("limit")
+	sinceStr := c.QueryParam("since")
+	untilStr := c.QueryParam("until")
 
-	var err error
-	var profiles []core.Profile
-
-	if author != "" && schema != "" {
-		profiles, err = h.service.GetByAuthorAndSchema(ctx, author, schema)
-	} else if author != "" {
-		profiles, err = h.service.GetByAuthor(ctx, author)
-	} else if schema != "" {
-		profiles, err = h.service.GetBySchema(ctx, schema)
-	} else {
-		return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request", "message": "author or schema is required"})
+	since := time.Time{}
+	if sinceStr != "" {
+		epoch, err := strconv.ParseInt(sinceStr, 10, 64)
+		if err != nil {
+			span.RecordError(err)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request"})
+		}
+		since = time.Unix(epoch, 0)
 	}
+
+	until := time.Time{}
+	var err error
+	if untilStr != "" {
+		epoch, err := strconv.ParseInt(untilStr, 10, 64)
+		if err != nil {
+			span.RecordError(err)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request"})
+		}
+		until = time.Unix(epoch, 0)
+	}
+
+	limit := 16
+	if limitStr != "" {
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			span.RecordError(err)
+			return c.JSON(http.StatusBadRequest, echo.Map{"error": "Invalid request"})
+		}
+	}
+
+	if limit > 100 {
+		limit = 100
+	}
+
+	profiles, err := h.service.Query(ctx, author, schema, limit, since, until)
 
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})

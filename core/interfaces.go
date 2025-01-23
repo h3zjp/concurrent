@@ -110,6 +110,7 @@ type ProfileService interface {
 	GetByAuthorAndSchema(ctx context.Context, owner string, schema string) ([]Profile, error)
 	GetByAuthor(ctx context.Context, owner string) ([]Profile, error)
 	GetBySchema(ctx context.Context, schema string) ([]Profile, error)
+	Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]Profile, error)
 }
 
 type SchemaService interface {

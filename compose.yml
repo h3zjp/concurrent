@@ -83,6 +83,15 @@ services:
       options: 
         loki-url: http://localhost:3100/loki/api/v1/push
 
+  hyperproxy:
+    image: ghcr.io/concrnt/hyperproxy:latest
+    restart: always
+    expose:
+      - 8080
+    networks:
+      - external
+      - internal
+
   db:
     restart: always
     image: postgres:16-bookworm

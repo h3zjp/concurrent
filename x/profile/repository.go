@@ -3,7 +3,9 @@ package profile
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strconv"
+	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/pkg/errors"
@@ -22,6 +24,7 @@ type Repository interface {
 	Delete(ctx context.Context, id string) (core.Profile, error)
 	Clean(ctx context.Context, ccid string) error
 	Count(ctx context.Context) (int64, error)
+	Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]core.Profile, error)
 }
 
 type repository struct {
@@ -307,4 +310,51 @@ func (r *repository) Clean(ctx context.Context, ccid string) error {
 	}
 
 	return nil
+}
+
+func (r *repository) Query(ctx context.Context, author, schema string, limit int, since, until time.Time) ([]core.Profile, error) {
+	ctx, span := tracer.Start(ctx, "Profile.Repository.Query")
+	defer span.End()
+
+	var profiles []core.Profile
+	query := r.db.WithContext(ctx)
+
+	if author != "" {
+		query = query.Where("author = ?", author)
+	}
+
+	if schema != "" {
+		schemaID, err := r.schema.UrlToID(ctx, schema)
+		if err != nil {
+			return []core.Profile{}, err
+		}
+		query = query.Where("schema_id = ?", schemaID)
+	}
+
+	var err error
+	if !since.IsZero() {
+		err = query.Where("c_date > ?", since).Order("c_date asc").Limit(limit).Find(&profiles).Error
+		slices.Reverse(profiles)
+	} else if !until.IsZero() {
+		err = query.Where("c_date < ?", until).Order("c_date desc").Limit(limit).Find(&profiles).Error
+	} else {
+		err = query.Order("c_date desc").Limit(limit).Find(&profiles).Error
+	}
+
+	if err != nil {
+		return []core.Profile{}, err
+	}
+
+	if profiles == nil {
+		return []core.Profile{}, nil
+	}
+
+	for i := range profiles {
+		err := r.postProcess(ctx, &profiles[i])
+		if err != nil {
+			return []core.Profile{}, err
+		}
+	}
+
+	return profiles, nil
 }
