@@ -24,8 +24,9 @@ func TestGetRecentItemsSimple(t *testing.T) {
 
 	mockRepo := mock_timeline.NewMockRepository(ctrl)
 	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "t00000000000000000000000000").
-		Return("t00000000000000000000000000@local.example.com", nil).AnyTimes()
+		GetNormalizationCaches(gomock.Any(), []string{"t00000000000000000000000000"}).
+		Return(map[string]string{"t00000000000000000000000000": "t00000000000000000000000000@local.example.com"}, nil).
+		AnyTimes()
 	mockRepo.EXPECT().
 		LookupChunkItrs(gomock.Any(), []string{"t00000000000000000000000000@local.example.com"}, pivotEpoch).
 		Return(map[string]string{"t00000000000000000000000000@local.example.com": pivotEpoch}, nil)
@@ -112,8 +113,9 @@ func TestGetRecentItemsLoadMore(t *testing.T) {
 
 	mockRepo := mock_timeline.NewMockRepository(ctrl)
 	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "t00000000000000000000000000").
-		Return("t00000000000000000000000000@local.example.com", nil).AnyTimes()
+		GetNormalizationCaches(gomock.Any(), []string{"t00000000000000000000000000"}).
+		Return(map[string]string{"t00000000000000000000000000": "t00000000000000000000000000@local.example.com"}, nil).
+		AnyTimes()
 	mockRepo.EXPECT().
 		LookupChunkItrs(gomock.Any(), []string{"t00000000000000000000000000@local.example.com"}, pivotEpoch).
 		Return(map[string]string{"t00000000000000000000000000@local.example.com": pivotEpoch}, nil)
@@ -211,25 +213,27 @@ func TestGetRecentItemsWide(t *testing.T) {
 
 	mockRepo := mock_timeline.NewMockRepository(ctrl)
 	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "t00000000000000000000000000").
-		Return("t00000000000000000000000000@local.example.com", nil).AnyTimes()
-	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "test@con1t0tey8uxhkqkd4wcp4hd4jedt7f0vfhk29xdd2").
-		Return("t11111111111111111111111111@local.example.com", nil).AnyTimes()
-	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com").
-		Return("taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com", nil).AnyTimes()
-	mockRepo.EXPECT().
-		GetNormalizationCache(gomock.Any(), "test@con1jmcread5dear85emug5gh3wvaf6st9av0kuxaj").
-		Return("tbbbbbbbbbbbbbbbbbbbbbbbbbb@remote.example.com", nil).AnyTimes()
+		GetNormalizationCaches(gomock.Any(),
+			gomock.InAnyOrder([]string{
+				"t00000000000000000000000000",
+				"test@con1t0tey8uxhkqkd4wcp4hd4jedt7f0vfhk29xdd2",
+				"taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com",
+				"test@con1jmcread5dear85emug5gh3wvaf6st9av0kuxaj",
+			}),
+		).Return(map[string]string{
+		"t00000000000000000000000000":                     "t00000000000000000000000000@local.example.com",
+		"test@con1t0tey8uxhkqkd4wcp4hd4jedt7f0vfhk29xdd2": "t11111111111111111111111111@local.example.com",
+		"taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com":  "taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com",
+		"test@con1jmcread5dear85emug5gh3wvaf6st9av0kuxaj": "tbbbbbbbbbbbbbbbbbbbbbbbbbb@remote.example.com",
+	}, nil).AnyTimes()
 
 	mockRepo.EXPECT().
-		LookupChunkItrs(gomock.Any(), []string{
+		LookupChunkItrs(gomock.Any(), gomock.InAnyOrder([]string{
 			"t00000000000000000000000000@local.example.com",
 			"t11111111111111111111111111@local.example.com",
 			"taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com",
 			"tbbbbbbbbbbbbbbbbbbbbbbbbbb@remote.example.com",
-		}, pivotEpoch).
+		}), pivotEpoch).
 		Return(map[string]string{
 			"t00000000000000000000000000@local.example.com":  pivotEpoch,
 			"t11111111111111111111111111@local.example.com":  pivotEpoch,
@@ -240,12 +244,13 @@ func TestGetRecentItemsWide(t *testing.T) {
 	mockRepo.EXPECT().ListRecentlyRemovedItems(gomock.Any(), gomock.Any()).Return(map[string][]string{}, nil)
 
 	mockRepo.EXPECT().
-		LoadChunkBodies(gomock.Any(), map[string]string{
-			"t00000000000000000000000000@local.example.com":  pivotEpoch,
-			"t11111111111111111111111111@local.example.com":  pivotEpoch,
-			"taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com": pivotEpoch,
-			"tbbbbbbbbbbbbbbbbbbbbbbbbbb@remote.example.com": pivotEpoch,
-		}).
+		LoadChunkBodies(gomock.Any(),
+			gomock.AssignableToTypeOf(map[string]string{
+				"t00000000000000000000000000@local.example.com":  pivotEpoch,
+				"t11111111111111111111111111@local.example.com":  pivotEpoch,
+				"taaaaaaaaaaaaaaaaaaaaaaaaaa@remote.example.com": pivotEpoch,
+				"tbbbbbbbbbbbbbbbbbbbbbbbbbb@remote.example.com": pivotEpoch,
+			})).
 		Return(map[string]core.Chunk{
 			"t00000000000000000000000000@local.example.com": {
 				Epoch: pivotEpoch,
@@ -394,6 +399,8 @@ func TestGetRecentItemsWide(t *testing.T) {
 	mockSemantic := mock_core.NewMockSemanticIDService(ctrl)
 	mockSubscription := mock_core.NewMockSubscriptionService(ctrl)
 	mockPolicy := mock_core.NewMockPolicyService(ctrl)
+
+	mockDomain.EXPECT().GetByFQDN(gomock.Any(), gomock.Any()).Return(core.Domain{}, nil).AnyTimes()
 
 	service := NewService(
 		mockRepo,

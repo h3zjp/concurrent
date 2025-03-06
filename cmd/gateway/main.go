@@ -146,7 +146,7 @@ func main() {
 				return service
 			},
 			"url": func(c echo.Context, err error) string {
-				return "REDACTED"
+				return c.Response().Header().Get("X-RateLimit-Path")
 			},
 		},
 		Skipper: func(c echo.Context) bool {
@@ -355,11 +355,93 @@ func main() {
 `)
 	})
 
+	infoCache := make(map[string]struct {
+		info      core.CCInfo
+		fetchedAt time.Time
+	})
+
+	getInfo := func(service Service) core.CCInfo {
+
+		cache, ok := infoCache[service.Host]
+
+		fetcher := func() core.CCInfo {
+
+			info := core.CCInfo{
+				Name:    "unknown",
+				Version: "unknown",
+			}
+
+			var resp *http.Response
+			var err error
+			client := &http.Client{}
+
+			url := "http://" + service.Host + ":" + strconv.Itoa(service.Port) + "/cc-info"
+			fmt.Printf("fetching %s\n", url)
+			req, err := http.NewRequest("GET", url, nil)
+			if err != nil {
+				goto CACHE_STEP
+			}
+
+			resp, err = client.Do(req)
+			if err != nil {
+				goto CACHE_STEP
+			}
+
+			defer resp.Body.Close()
+
+			err = json.NewDecoder(resp.Body).Decode(&info)
+			if err != nil {
+				goto CACHE_STEP
+			}
+
+			if info.Name == "" {
+				info.Name = "unknown"
+			}
+
+			if info.Version == "" {
+				info.Version = "unknown"
+			}
+
+		CACHE_STEP:
+
+			infoCache[service.Host] = struct {
+				info      core.CCInfo
+				fetchedAt time.Time
+			}{info, time.Now()}
+
+			return info
+		}
+
+		if ok {
+			threadhold := 30 * time.Minute
+			if cache.info.Version == "unknown" {
+				threadhold = 5 * time.Minute
+			}
+			if time.Since(cache.fetchedAt) > threadhold {
+				go fetcher()
+			}
+			fmt.Printf("cache hit %s\n", service.Name)
+			return cache.info
+		}
+
+		return fetcher()
+	}
+
 	e.GET("/services", func(c echo.Context) (err error) {
 		services := make(map[string]ServiceInfo)
+
+		services["net.concrnt.gateway"] = ServiceInfo{
+			Path:    "/",
+			Name:    "github.com/totegamma/concurrent/ccgateway",
+			Version: version,
+		}
+
 		for _, service := range gwConf.Services {
+			info := getInfo(service)
 			services[service.Name] = ServiceInfo{
-				Path: service.Path,
+				Path:    service.Path,
+				Name:    info.Name,
+				Version: info.Version,
 			}
 		}
 		return c.JSON(http.StatusOK, services)

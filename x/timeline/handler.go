@@ -52,8 +52,8 @@ func (h handler) Get(c echo.Context) error {
 	timelineID := c.Param("id")
 	timeline, err := h.service.GetTimeline(ctx, timelineID)
 	if err != nil {
-		if errors.Is(err, core.ErrorNotFound{}) {
-			return c.JSON(http.StatusNotFound, echo.Map{"error": "User not found"})
+		if errors.Is(err, core.ErrorNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "Timeline not found"})
 		}
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
 	}
@@ -354,11 +354,24 @@ func (h handler) Realtime(c echo.Context) error {
 			var req Request
 			err := ws.ReadJSON(&req)
 			if err != nil {
-				slog.ErrorContext(
-					ctx, "Error reading JSON",
-					slog.String("error", err.Error()),
-					slog.String("module", "socket"),
-				)
+
+				wsErr, ok := err.(*websocket.CloseError)
+				if ok {
+					if !(wsErr.Code == websocket.CloseNormalClosure || wsErr.Code == websocket.CloseGoingAway) {
+						slog.DebugContext(
+							ctx, "WebSocket closed",
+							slog.String("error", wsErr.Error()),
+							slog.String("module", "socket"),
+						)
+					}
+				} else {
+					slog.ErrorContext(
+						ctx, "Error reading message",
+						slog.String("error", err.Error()),
+						slog.String("module", "socket"),
+					)
+				}
+
 				quit <- struct{}{}
 				break
 			}

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -20,11 +19,16 @@ import (
 	"github.com/totegamma/concurrent/core"
 )
 
+type workerConn struct {
+	Conn   *websocket.Conn
+	Cancel context.CancelFunc
+}
+
 var (
 	pingInterval      = 10 * time.Second
 	disconnectTimeout = 30 * time.Second
 	remoteSubs        = make(map[string][]string)
-	remoteConns       = make(map[string]*websocket.Conn)
+	remoteConns       = make(map[string]*workerConn)
 )
 
 type Keeper interface {
@@ -146,29 +150,28 @@ func (k *keeper) deleteExcessiveSubs(ctx context.Context) {
 
 	currentSubs := k.GetCurrentSubs(ctx)
 
-	var closeList []string
+	closeList := make([]string, 0)
 
 	for domain, timelines := range remoteSubs {
-		for _, timeline := range timelines {
-			var newSubs []string
+		var newSubs []string
+		for _, timeline := range timelines { // domainのtimelineとcurrentSubsの積を取る
 			for _, currentSub := range currentSubs {
 				if currentSub == timeline {
 					newSubs = append(newSubs, currentSub)
 				}
 			}
-			remoteSubs[domain] = newSubs
+		}
+		remoteSubs[domain] = newSubs
 
-			if len(remoteSubs[domain]) == 0 {
-				closeList = append(closeList, domain)
-			}
+		if len(remoteSubs[domain]) == 0 {
+			closeList = append(closeList, domain)
 		}
 	}
 
 	for _, domain := range closeList {
-
 		// close connection
 		if conn, ok := remoteConns[domain]; ok {
-			conn.Close()
+			conn.Cancel()
 		}
 
 		delete(remoteSubs, domain)
@@ -187,53 +190,31 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 	if _, ok := remoteConns[domain]; !ok {
 		// new server, create new connection
 
-		// check server availability
-		domainInfo, err := k.client.GetDomain(ctx, domain, nil)
+		c, err := k.client.ConnectWebsocket(ctx, domain, "/api/v1/timelines/realtime")
 		if err != nil {
-			slog.Error(
-				fmt.Sprintf("fail to get domain info: %v", err),
-				slog.String("module", "agent"),
-				slog.String("group", "realtime"),
-			)
-			return
-		}
-		if domainInfo.Dimension != k.config.Dimension {
-			slog.Error(
-				fmt.Sprintf("domain dimention mismatch: %s", domain),
-				slog.String("module", "agent"),
-				slog.String("group", "realtime"),
-			)
-			return
-		}
-
-		u := url.URL{Scheme: "wss", Host: domain, Path: "/api/v1/timelines/realtime"}
-		dialer := websocket.DefaultDialer
-		dialer.HandshakeTimeout = 10 * time.Second
-
-		c, _, err := dialer.Dial(u.String(), nil)
-		if err != nil {
-			slog.Error(
-				fmt.Sprintf("fail to dial to %v (%v)", domain, err),
-				slog.String("module", "agent"),
-				slog.String("group", "realtime"),
-			)
-
+			// ここでerrorなのはofflineの場合なので、無視するしかない
 			delete(remoteConns, domain)
 			return
 		}
 
-		remoteConns[domain] = c
+		workerCtx, cancel := context.WithCancel(ctx)
+
+		remoteConns[domain] = &workerConn{
+			Conn:   c,
+			Cancel: cancel,
+		}
 
 		messageChan := make(chan []byte)
 		// goroutine for reading messages from remote server
-		go func(c *websocket.Conn, messageChan chan<- []byte) {
+		go func(ctx context.Context, c *websocket.Conn, messageChan chan<- []byte) {
 			defer func() {
+				cancel()
 				if c != nil {
 					c.Close()
 				}
 				delete(remoteConns, domain)
-				slog.Info(
-					fmt.Sprintf("remote connection closed: %s", domain),
+				slog.Debug(
+					fmt.Sprintf("remote connection closed(reader): %s", domain),
 					slog.String("module", "agent"),
 					slog.String("group", "realtime"),
 				)
@@ -250,6 +231,11 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 				}
 				_, message, err := c.ReadMessage()
 				if err != nil {
+
+					if ctx.Err() != nil {
+						break
+					}
+
 					slog.Error(
 						fmt.Sprintf("fail to read message: %v", err),
 						slog.String("module", "agent"),
@@ -259,19 +245,20 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 				}
 				messageChan <- message
 			}
-		}(c, messageChan)
+		}(workerCtx, c, messageChan)
 
 		// goroutine for relay messages to clients
-		go func(c *websocket.Conn, messageChan <-chan []byte) {
+		go func(ctx context.Context, c *websocket.Conn, messageChan <-chan []byte) {
 			pingTicker := time.NewTicker(pingInterval)
 			defer func() {
+				cancel()
 				if c != nil {
 					c.Close()
 				}
 				pingTicker.Stop()
 				delete(remoteConns, domain)
-				slog.Info(
-					fmt.Sprintf("remote connection closed: %s", domain),
+				slog.Debug(
+					fmt.Sprintf("remote connection closed(relayer): %s", domain),
 					slog.String("module", "agent"),
 					slog.String("group", "remote ws.publisher"),
 				)
@@ -285,6 +272,10 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 
 			for {
 				select {
+
+				case <-ctx.Done():
+					return
+
 				case message := <-messageChan:
 
 					slog.Debug(
@@ -364,13 +355,13 @@ func (k *keeper) remoteSubRoutine(ctx context.Context, domain string, timelines 
 					}
 				}
 			}
-		}(c, messageChan)
+		}(workerCtx, c, messageChan)
 	}
 	request := channelRequest{
 		Type:     "listen",
 		Channels: timelines,
 	}
-	err := remoteConns[domain].WriteJSON(request)
+	err := remoteConns[domain].Conn.WriteJSON(request)
 	if err != nil {
 		slog.Error(
 			fmt.Sprintf("fail to send subscribe request to remote server %v", domain),

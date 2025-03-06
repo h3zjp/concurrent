@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/totegamma/concurrent/core"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -41,6 +44,7 @@ type Client interface {
 	GetChunkItrs(ctx context.Context, domain string, timelines []string, epoch string, opts *Options) (map[string]string, error)
 	GetChunkBodies(ctx context.Context, domain string, query map[string]string, opts *Options) (map[string]core.Chunk, error)
 	GetRetracted(ctx context.Context, domain string, timelines []string, opts *Options) (map[string][]string, error)
+	ConnectWebsocket(ctx context.Context, domain string, path string) (*websocket.Conn, error)
 }
 
 type remapRecord struct {
@@ -73,6 +77,7 @@ func NewClient() Client {
 
 type Options struct {
 	AuthToken string
+	Passport  string
 }
 
 func (c *client) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -123,12 +128,10 @@ func (c *client) UpKeeper() {
 			if _, ok := c.failCount[domain]; !ok {
 				c.failCount[domain] = 0
 			}
-			var span int = 600
-			if c.failCount[domain] < 10 {
-				span = 1 << c.failCount[domain]
-			}
+
+			var span = 0.5 * math.Pow(1.5, float64(min(c.failCount[domain], 23))) // max: 10 minutes
 			if time.Since(lastFailed) > time.Duration(span)*time.Second {
-				log.Printf("Domain %s is offline. Fail count: %d", domain, c.failCount[domain])
+				slog.Info(fmt.Sprintf("Domain %s is offline. Fail count: %d", domain, c.failCount[domain]))
 				// health check
 				_, err := httpRequest[core.Domain](ctx, c.client, "GET", "https://"+domain+"/api/v1/domain", "", &Options{})
 				if err != nil {
@@ -136,13 +139,8 @@ func (c *client) UpKeeper() {
 						c.lastFailed[domain] = time.Now()
 					}
 					c.failCount[domain]++
-					if c.failCount[domain] > 20 {
-						log.Printf("Domain %s is still offline after 20 retries. Bye bye :(", domain)
-						delete(c.lastFailed, domain)
-						delete(c.failCount, domain)
-					}
 				} else {
-					log.Printf("Domain %s is back online :3", domain)
+					slog.Info(fmt.Sprintf("Domain %s is back online :3", domain))
 					delete(c.lastFailed, domain)
 					delete(c.failCount, domain)
 				}
@@ -170,13 +168,10 @@ func (c *client) Commit(ctx context.Context, domain, body string, response any, 
 		if opts.AuthToken != "" {
 			req.Header.Set("Authorization", "Bearer "+opts.AuthToken)
 		}
+		if opts.Passport != "" {
+			req.Header.Set(core.RequesterPassportHeader, opts.Passport)
+		}
 	}
-
-	passport, ok := ctx.Value(core.RequesterPassportKey).(string)
-	if ok {
-		req.Header.Set(core.RequesterPassportHeader, passport)
-	}
-	span.SetAttributes(attribute.String("passport", passport))
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
@@ -214,11 +209,9 @@ func httpRequest[T any](ctx context.Context, client *http.Client, method, url, b
 		if opts.AuthToken != "" {
 			req.Header.Set("Authorization", "Bearer "+opts.AuthToken)
 		}
-	}
-
-	passport, ok := ctx.Value(core.RequesterPassportKey).(string)
-	if ok {
-		req.Header.Set(core.RequesterPassportHeader, passport)
+		if opts.Passport != "" {
+			req.Header.Set(core.RequesterPassportHeader, opts.Passport)
+		}
 	}
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
@@ -236,8 +229,9 @@ func httpRequest[T any](ctx context.Context, client *http.Client, method, url, b
 	}
 
 	if response.Status != "ok" {
-		log.Printf("error: %v", string(body))
-		return nil, fmt.Errorf("Request failed(%s): %v", resp.Status, string(body))
+		err = fmt.Errorf("Request failed(%s): %v", resp.Status, string(body))
+		slog.InfoContext(ctx, err.Error())
+		return nil, err
 	}
 
 	return &response.Content, nil
@@ -530,4 +524,29 @@ func (c *client) GetRetracted(ctx context.Context, domain string, timelines []st
 	}
 
 	return *response, nil
+}
+
+func (c *client) ConnectWebsocket(ctx context.Context, domain string, path string) (*websocket.Conn, error) {
+	_, span := tracer.Start(ctx, "Client.ConnectWebsocket")
+	defer span.End()
+
+	if !c.IsOnline(domain) {
+		return nil, fmt.Errorf("Domain is offline")
+	}
+
+	u := url.URL{Scheme: "wss", Host: domain, Path: path}
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	header := http.Header{}
+	header.Set("User-Agent", c.userAgent)
+
+	conn, _, err := dialer.Dial(u.String(), header)
+	if err != nil {
+		c.lastFailed[domain] = time.Now()
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return conn, nil
 }
