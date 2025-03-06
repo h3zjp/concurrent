@@ -70,9 +70,9 @@ func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 var (
-	version      = "v1.6.6"
+	version      = "v1.6.10"
 	buildMachine = "AlmaLinux release 9.5 (Teal Serval)"
-	buildTime    = "Wed Feb 12 03:42:00 UTC 2025"
+	buildTime    = "Tue Mar 4 22:05:00 JST 2025"
 	goVersion    = "go1.22.4 linux/amd64"
 )
 
