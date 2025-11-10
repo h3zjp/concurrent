@@ -1,10 +1,7 @@
 package main
 
 import (
-	"github.com/go-yaml/yaml"
-	"github.com/totegamma/concurrent/core"
-	"log"
-	"os"
+	"github.com/concrnt/concrnt/core"
 )
 
 // Config is Concurrent base configuration
@@ -46,22 +43,4 @@ type Profile struct {
 	Version      string    `yaml:"version" json:"version"`
 	BuildInfo    BuildInfo `yaml:"buildInfo" json:"buildInfo"`
 	SiteKey      string    `yaml:"captchaSiteKey" json:"captchaSiteKey"`
-}
-
-// Load loads concurrent config from given path
-func (c *Config) Load(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Fatal("failed to open configuration file:", err)
-		return err
-	}
-	defer f.Close()
-
-	err = yaml.NewDecoder(f).Decode(&c)
-	if err != nil {
-		log.Fatal("failed to load configuration file:", err)
-		return err
-	}
-
-	return nil
 }

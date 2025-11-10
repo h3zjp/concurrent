@@ -2,8 +2,8 @@
 package auth
 
 import (
+	"github.com/concrnt/concrnt/core"
 	"github.com/labstack/echo/v4"
-	"github.com/totegamma/concurrent/core"
 	"go.opentelemetry.io/otel"
 	"net/http"
 )
@@ -24,8 +24,8 @@ func NewHandler(service core.AuthService) Handler {
 	return &handler{service}
 }
 
-// Claim is used for get server signed jwt
-// input user signed jwt
+// GetPassport issues a server-signed JWT (passport) to the authenticated requester.
+// It uses the requester's ID and keychain information from the context.
 func (h *handler) GetPassport(c echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "Auth.Handler.GetPassport")
 	defer span.End()
@@ -43,5 +43,5 @@ func (h *handler) GetPassport(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, echo.Map{"error": err.Error()})
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"content": response})
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": response})
 }

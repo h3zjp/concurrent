@@ -7,30 +7,37 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/internal/testutil"
+	cc "github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/util"
 )
 
 var tracer = otel.Tracer("policy")
 
 type service struct {
 	repository Repository
+	client     cc.Client
 	global     core.Policy
 	config     core.Config
 }
 
-func NewService(repository Repository, globalPolicy core.Policy, config core.Config) core.PolicyService {
+func NewService(repository Repository, client cc.Client, globalPolicy core.Policy, config core.Config) core.PolicyService {
 	return &service{
 		repository,
+		client,
 		globalPolicy,
 		config,
 	}
 }
 
+// Summerize combines multiple policy evaluation results into a single boolean outcome (allow/deny).
+// It considers dominant results (Always/Never), then Allow/Deny, and finally falls back to defaults
+// defined in the global policy or provided overrides for the specific action.
 func (s service) Summerize(results []core.PolicyEvalResult, action string, override *map[string]bool) bool {
 	_, span := tracer.Start(context.Background(), "Policy.Service.Summerize")
 	defer span.End()
@@ -71,6 +78,10 @@ func (s service) Summerize(results []core.PolicyEvalResult, action string, overr
 	return result
 }
 
+// AccumulateOr combines multiple policy evaluation results using OR logic, preserving the PolicyEvalResult type.
+// Dominant results (Always, Never) take precedence. If conflicting dominant results exist, it defaults.
+// Otherwise, Allow takes precedence over Deny, which takes precedence over Default.
+// Error results are treated based on the default outcome for the action.
 func (s service) AccumulateOr(results []core.PolicyEvalResult, action string, override *map[string]bool) core.PolicyEvalResult {
 	_, span := tracer.Start(context.Background(), "Policy.Service.AccumulateOr")
 	defer span.End()
@@ -131,6 +142,7 @@ func (s service) AccumulateOr(results []core.PolicyEvalResult, action string, ov
 	return core.PolicyEvalResultDefault
 }
 
+// TestWithGlobalPolicy evaluates an action against the global policy using the provided request context.
 func (s service) TestWithGlobalPolicy(ctx context.Context, context core.RequestContext, action string) (core.PolicyEvalResult, error) {
 	ctx, span := tracer.Start(ctx, "Policy.Service.TestWithGlobalPolicy")
 	defer span.End()
@@ -138,6 +150,8 @@ func (s service) TestWithGlobalPolicy(ctx context.Context, context core.RequestC
 	return s.test(ctx, s.global, context, action)
 }
 
+// TestWithPolicyURL fetches a policy from a URL (using cache) and evaluates it against the given context and action.
+// If fetching fails, it falls back to evaluating against the global policy.
 func (s service) TestWithPolicyURL(ctx context.Context, url string, context core.RequestContext, action string) (core.PolicyEvalResult, error) {
 	ctx, span := tracer.Start(ctx, "Policy.Service.TestWithPolicyURL")
 	defer span.End()
@@ -160,6 +174,10 @@ func (s service) TestWithPolicyURL(ctx context.Context, url string, context core
 	return s.Test(ctx, policy, context, action)
 }
 
+// Test evaluates a specific policy against the given context and action.
+// It first evaluates the global policy. If the global result is dominant (Always/Never), it returns that.
+// Otherwise, it evaluates the provided local policy. If the local result is Default, it returns the global result.
+// Otherwise, it returns the local result.
 func (s service) Test(ctx context.Context, policy core.Policy, context core.RequestContext, action string) (core.PolicyEvalResult, error) {
 	ctx, span := tracer.Start(ctx, "Policy.Service.Test")
 	defer span.End()
@@ -203,7 +221,7 @@ func (s service) test(ctx context.Context, policy core.Policy, context core.Requ
 		return core.PolicyEvalResultDefault, nil
 	}
 
-	result, err := s.eval(statement.Condition, context)
+	result, err := s.eval(ctx, statement.Condition, context)
 	resultJson, _ := json.MarshalIndent(result, "", "  ")
 	span.SetAttributes(attribute.String("result", string(resultJson)))
 	if err != nil {
@@ -233,14 +251,17 @@ func (s service) test(ctx context.Context, policy core.Policy, context core.Requ
 	}
 }
 
-func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.EvalResult, error) {
+func (s service) eval(ctx context.Context, expr core.Expr, requestCtx core.RequestContext) (core.EvalResult, error) {
 
 	defer func() {
 		if r := recover(); r != nil {
+			_, span := tracer.Start(ctx, "Policy.Service.eval.recover")
+			span.SetStatus(codes.Error, fmt.Sprintf("%v", r))
+			fmt.Printf("Panic occured. traceID: %s\n", span.SpanContext().TraceID().String())
 			fmt.Printf("recovered from: %v\n", r)
 			fmt.Printf("while evaluating: %v\n", expr.Operator)
-			debugPrint("expr", expr)
-			debugPrint("requestCtx", requestCtx)
+			util.JsonPrint("expr", expr)
+			util.JsonPrint("requestCtx", requestCtx)
 		}
 	}()
 
@@ -248,7 +269,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 	case "And":
 		args := make([]core.EvalResult, 0)
 		for _, arg := range expr.Args {
-			eval, err := s.eval(arg, requestCtx)
+			eval, err := s.eval(ctx, arg, requestCtx)
 			if err != nil {
 				return core.EvalResult{
 					Operator: "And",
@@ -285,7 +306,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 	case "Or":
 		args := make([]core.EvalResult, 0)
 		for _, arg := range expr.Args {
-			eval, err := s.eval(arg, requestCtx)
+			eval, err := s.eval(ctx, arg, requestCtx)
 			if err != nil {
 				return core.EvalResult{
 					Operator: "Or",
@@ -326,7 +347,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "Not",
@@ -360,7 +381,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "Eq",
@@ -369,7 +390,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg1_raw, err := s.eval(expr.Args[1], requestCtx)
+		arg1_raw, err := s.eval(ctx, expr.Args[1], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "Eq",
@@ -399,7 +420,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "Contains",
@@ -418,7 +439,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg1_raw, err := s.eval(expr.Args[1], requestCtx)
+		arg1_raw, err := s.eval(ctx, expr.Args[1], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "Contains",
@@ -456,7 +477,6 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 		value, ok := resolveDotNotation(requestCtx.Params, key)
 		if !ok {
 			err := fmt.Errorf("key not found: %s\n", key)
-			testutil.PrintJson(requestCtx)
 			return core.EvalResult{
 				Operator: "LoadParam",
 				Error:    err.Error(),
@@ -564,7 +584,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "IsCCID",
@@ -598,7 +618,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "IsCSID",
@@ -632,7 +652,7 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 			}, err
 		}
 
-		arg0_raw, err := s.eval(expr.Args[0], requestCtx)
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
 		if err != nil {
 			return core.EvalResult{
 				Operator: "IsCKID",
@@ -713,6 +733,136 @@ func (s service) eval(expr core.Expr, requestCtx core.RequestContext) (core.Eval
 		return core.EvalResult{
 			Operator: "RequesterDomainHasTag",
 			Result:   tags.Has(target),
+		}, nil
+
+	case "Acks":
+		if len(expr.Args) != 2 {
+			err := fmt.Errorf("bad argument length for Acks. Expected 2 but got %d\n", len(expr.Args))
+			return core.EvalResult{
+				Operator: "Acks",
+				Error:    err.Error(),
+			}, err
+		}
+
+		arg0_raw, err := s.eval(ctx, expr.Args[0], requestCtx)
+		if err != nil {
+			return core.EvalResult{
+				Operator: "Acks",
+				Args:     []core.EvalResult{arg0_raw},
+				Error:    err.Error(),
+			}, err
+		}
+		arg0, ok := arg0_raw.Result.(string)
+		if !ok {
+			err := fmt.Errorf("bad argument type for Acks. Expected string but got %s\n", reflect.TypeOf(arg0_raw.Result))
+			return core.EvalResult{
+				Operator: "Acks",
+				Args:     []core.EvalResult{arg0_raw},
+				Error:    err.Error(),
+			}, err
+		}
+
+		arg1_raw, err := s.eval(ctx, expr.Args[1], requestCtx)
+		if err != nil {
+			return core.EvalResult{
+				Operator: "Acks",
+				Args:     []core.EvalResult{arg0_raw, arg1_raw},
+				Error:    err.Error(),
+			}, err
+		}
+		arg1, ok := arg1_raw.Result.(string)
+
+		if !ok {
+			err := fmt.Errorf("bad argument type for Acks. Expected string but got %s\n", reflect.TypeOf(arg1_raw.Result))
+			return core.EvalResult{
+				Operator: "Acks",
+				Args:     []core.EvalResult{arg0_raw, arg1_raw},
+				Error:    err.Error(),
+			}, err
+		}
+
+		ack, err := s.client.GetAck(ctx, arg0, arg1, &cc.Options{Cache: "try-cache"})
+		if err != nil {
+			if errors.Is(err, core.ErrorNotFound) {
+				return core.EvalResult{
+					Operator: "Acks",
+					Args:     []core.EvalResult{arg0_raw, arg1_raw},
+					Result:   false,
+				}, nil
+			}
+
+			return core.EvalResult{
+				Operator: "Acks",
+				Args:     []core.EvalResult{arg0_raw, arg1_raw},
+				Error:    err.Error(),
+			}, err
+		}
+
+		return core.EvalResult{
+			Operator: "Acks",
+			Args:     []core.EvalResult{arg0_raw, arg1_raw},
+			Result:   ack.Valid,
+		}, nil
+
+	case "Cond": // Renamed from "Conditional"
+		if len(expr.Args) != 3 {
+			err := fmt.Errorf("bad argument length for Cond. Expected 3 but got %d\n", len(expr.Args))
+			return core.EvalResult{
+				Operator: "Cond",
+				Error:    err.Error(),
+			}, err
+		}
+
+		// Evaluate condition (arg 0)
+		conditionResult, err := s.eval(ctx, expr.Args[0], requestCtx)
+		if err != nil {
+			return core.EvalResult{
+				Operator: "Cond",
+				Args:     []core.EvalResult{conditionResult},
+				Error:    fmt.Sprintf("condition error: %s", err.Error()),
+			}, err
+		}
+
+		conditionBool, ok := conditionResult.Result.(bool)
+		if !ok {
+			err := fmt.Errorf("bad condition type for Cond. Expected bool but got %s\n", reflect.TypeOf(conditionResult.Result))
+			return core.EvalResult{
+				Operator: "Cond",
+				Args:     []core.EvalResult{conditionResult},
+				Error:    err.Error(),
+			}, err
+		}
+
+		// Evaluate the chosen branch
+		var chosenBranchExpr core.Expr
+		var branchIndex int
+		if conditionBool {
+			chosenBranchExpr = expr.Args[1]
+			branchIndex = 1
+		} else {
+			chosenBranchExpr = expr.Args[2]
+			branchIndex = 2
+		}
+
+		branchResult, err := s.eval(ctx, chosenBranchExpr, requestCtx)
+		if err != nil {
+			// Include condition result in args for context
+			argsForError := []core.EvalResult{conditionResult, {}, {}} // Placeholders for branches
+			argsForError[branchIndex] = branchResult                   // Put the failing branch result in the correct spot
+			return core.EvalResult{
+				Operator: "Cond",
+				Args:     argsForError,
+				Error:    fmt.Sprintf("branch error: %s", err.Error()),
+			}, err
+		}
+
+		// Return the result of the evaluated branch
+		finalArgs := []core.EvalResult{conditionResult, {}, {}} // Placeholders
+		finalArgs[branchIndex] = branchResult
+		return core.EvalResult{
+			Operator: "Cond",
+			Args:     finalArgs,
+			Result:   branchResult.Result,
 		}, nil
 
 	default:

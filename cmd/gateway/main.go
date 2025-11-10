@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -23,10 +22,11 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
-	"github.com/totegamma/concurrent"
-	"github.com/totegamma/concurrent/client"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/x/auth"
+	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/util"
+	"github.com/concrnt/concrnt/x/auth"
 
 	"github.com/bradfitz/gomemcache/memcache"
 
@@ -36,11 +36,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
 	"gorm.io/plugin/opentelemetry/tracing"
 )
@@ -57,12 +53,24 @@ func main() {
 	e := echo.New()
 
 	// Configファイルの読み込み
-	config := Config{}
-	configPath := os.Getenv("CONCRNT_CONFIG")
-	if configPath == "" {
-		configPath = "/etc/concrnt/config/config.yaml"
+	configPaths := []string{}
+	configPath := os.Getenv("CONCRNT_CONFIG") // for backward compatibility
+	if configPath != "" {
+		configPaths = append(configPaths, configPath)
 	}
-	err := config.Load(configPath)
+
+	additional_configs := os.Getenv("CONCRNT_CONFIGS")
+	if additional_configs != "" {
+		for v := range strings.SplitSeq(additional_configs, ":") {
+			configPaths = append(configPaths, v)
+		}
+	}
+
+	if len(configPaths) == 0 {
+		configPaths = []string{"/etc/concrnt/config/config.yaml"}
+	}
+
+	config, err := util.LoadMultipleYamlFiles[Config](configPaths)
 	if err != nil {
 		e.Logger.Fatal(err)
 	}
@@ -82,6 +90,12 @@ func main() {
 	log.Printf("Concrnt %s starting...", version)
 	log.Printf("Config loaded! I am: %s @ %s", conconf.CCID, conconf.FQDN)
 
+	port := "192.168.10.3:8020"
+	envport := os.Getenv("CC_GATEWAY_PORT")
+	if envport != "" {
+		port = ":" + envport
+	}
+
 	// Echoの設定
 	e.HidePort = true
 	e.HideBanner = true
@@ -89,7 +103,7 @@ func main() {
 	e.Use(middleware.Recover())
 
 	if config.Server.EnableTrace {
-		cleanup, err := setupTraceProvider(config.Server.TraceEndpoint, config.Concrnt.FQDN+"/ccgateway", version)
+		cleanup, err := util.SetupTraceProvider(config.Server.TraceEndpoint, config.Concrnt.FQDN+"/ccgateway", version)
 		if err != nil {
 			panic(err)
 		}
@@ -210,10 +224,11 @@ func main() {
 	mc := memcache.New(config.Server.MemcachedAddr)
 	defer mc.Close()
 
-	client := client.NewClient()
+	client := client.NewClient(conconf.FQDN)
+	client.RegisterHostRemap(conconf.FQDN, "localhost"+port, false)
 	client.SetUserAgent("CCGateway", version)
 	globalPolicy := concurrent.GetDefaultGlobalPolicy()
-	policy := concurrent.SetupPolicyService(rdb, globalPolicy, conconf)
+	policy := concurrent.SetupPolicyService(rdb, client, globalPolicy, conconf)
 	authService := concurrent.SetupAuthService(db, rdb, mc, client, policy, conconf)
 
 	e.Use(authService.IdentifyIdentity)
@@ -336,7 +351,7 @@ func main() {
 	<body>
 		<h1>Concurrent Domain - `+config.Concrnt.FQDN+`</h1>
 		Yay! You're on ccgateway!<br>
-		You might looking for <a href="https://concrnt.world/">concrnt.world (v1)</a>.<br>
+		You might looking for <a href="https://concrnt.world/">concrnt.world</a>.<br>
 		This domain is currently registration: `+config.Concrnt.Registration+`<br>
 		<h2>Information</h2>
 		CSID: `+conconf.CSID+`
@@ -376,7 +391,6 @@ func main() {
 			client := &http.Client{}
 
 			url := "http://" + service.Host + ":" + strconv.Itoa(service.Port) + "/cc-info"
-			fmt.Printf("fetching %s\n", url)
 			req, err := http.NewRequest("GET", url, nil)
 			if err != nil {
 				goto CACHE_STEP
@@ -420,7 +434,6 @@ func main() {
 			if time.Since(cache.fetchedAt) > threadhold {
 				go fetcher()
 			}
-			fmt.Printf("cache hit %s\n", service.Name)
 			return cache.info
 		}
 
@@ -432,7 +445,7 @@ func main() {
 
 		services["net.concrnt.gateway"] = ServiceInfo{
 			Path:    "/",
-			Name:    "github.com/totegamma/concurrent/ccgateway",
+			Name:    "github.com/concrnt/concrnt/ccgateway",
 			Version: version,
 		}
 
@@ -477,52 +490,7 @@ func main() {
 
 	e.GET("/metrics", echoprometheus.NewHandler())
 
-	port := "192.168.10.14:8080"
-	envport := os.Getenv("CC_GATEWAY_PORT")
-	if envport != "" {
-		port = ":" + envport
-	}
 	e.Logger.Fatal(e.Start(port))
-}
-
-func setupTraceProvider(endpoint string, serviceName string, serviceVersion string) (func(), error) {
-
-	exporter, err := otlptracehttp.New(
-		context.Background(),
-		otlptracehttp.WithEndpoint(endpoint),
-		otlptracehttp.WithInsecure(),
-	)
-
-	if err != nil {
-		return nil, err
-	}
-	resource := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String(serviceName),
-		semconv.ServiceVersionKey.String(serviceVersion),
-	)
-
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithResource(resource),
-	)
-	otel.SetTracerProvider(tracerProvider)
-
-	propagator := propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	)
-	otel.SetTextMapPropagator(propagator)
-
-	cleanup := func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		if err := tracerProvider.Shutdown(ctx); err != nil {
-			log.Printf("Failed to shutdown tracer provider: %v", err)
-		}
-	}
-	return cleanup, nil
 }
 
 func singleJoiningSlash(a, b string) string {

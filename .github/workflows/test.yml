@@ -39,3 +39,11 @@ jobs:
     - name: Run tests with coverage
       run: go test -coverprofile=coverage.out $(go list ./x/... | grep -v mock)
 
+    - name: Assert no-containers running
+      run: |
+        if [ "$(docker ps -q)" ]; then
+          echo "There are running containers"
+          docker ps -a
+          exit 1
+        fi
+

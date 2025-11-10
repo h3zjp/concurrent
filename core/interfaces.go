@@ -11,6 +11,7 @@ import (
 
 type AckService interface {
 	Ack(ctx context.Context, mode CommitMode, document, signature string) (Ack, error)
+	Get(ctx context.Context, from, to string) (Ack, error)
 	GetAcker(ctx context.Context, key string) ([]Ack, error)
 	GetAcking(ctx context.Context, key string) ([]Ack, error)
 }
@@ -29,7 +30,7 @@ type AssociationService interface {
 	GetByTarget(ctx context.Context, targetID string) ([]Association, error)
 	GetCountsBySchema(ctx context.Context, messageID string) (map[string]int64, error)
 	GetBySchema(ctx context.Context, messageID string, schema string) ([]Association, error)
-	GetCountsBySchemaAndVariant(ctx context.Context, messageID string, schema string) (map[string]int64, error)
+	GetCountsBySchemaAndVariant(ctx context.Context, messageID string, schema string) (*OrderedKVMap[int64], error)
 	GetBySchemaAndVariant(ctx context.Context, messageID string, schema string, variant string) ([]Association, error)
 	GetOwnByTarget(ctx context.Context, targetID, author string) ([]Association, error)
 	Count(ctx context.Context) (int64, error)

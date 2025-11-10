@@ -12,10 +12,10 @@ import (
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/totegamma/concurrent/cdid"
-	"github.com/totegamma/concurrent/client"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/x/policy"
+	"github.com/concrnt/concrnt/cdid"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/x/policy"
 )
 
 type service struct {
@@ -69,6 +69,7 @@ func (s *service) Count(ctx context.Context) (int64, error) {
 	return s.repo.Count(ctx)
 }
 
+// Clean removes all associations owned by the specified ccid.
 func (s *service) Clean(ctx context.Context, ccid string) error {
 	ctx, span := tracer.Start(ctx, "Association.Service.Clean")
 	defer span.End()
@@ -704,7 +705,7 @@ func (s *service) GetBySchema(ctx context.Context, messageID string, schema stri
 }
 
 // GetCountsBySchemaAndVariant returns the number of associations by schema and variant
-func (s *service) GetCountsBySchemaAndVariant(ctx context.Context, messageID string, schema string) (map[string]int64, error) {
+func (s *service) GetCountsBySchemaAndVariant(ctx context.Context, messageID string, schema string) (*core.OrderedKVMap[int64], error) {
 	ctx, span := tracer.Start(ctx, "Association.Service.GetCountsBySchemaAndVariant")
 	defer span.End()
 

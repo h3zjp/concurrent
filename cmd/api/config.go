@@ -1,10 +1,7 @@
 package main
 
 import (
-	"github.com/go-yaml/yaml"
-	"github.com/totegamma/concurrent/core"
-	"log"
-	"os"
+	"github.com/concrnt/concrnt/core"
 )
 
 type Config struct {
@@ -15,6 +12,7 @@ type Config struct {
 
 type Server struct {
 	Dsn             string `yaml:"dsn"`
+	GatewayAddr     string `yaml:"gatewayAddr"`
 	RedisAddr       string `yaml:"redisAddr"`
 	RedisDB         int    `yaml:"redisDB"`
 	MemcachedAddr   string `yaml:"memcachedAddr"`
@@ -48,22 +46,4 @@ type Profile struct {
 	BuildInfo    BuildInfo `yaml:"buildInfo" json:"buildInfo"`
 	SiteKey      string    `yaml:"captchaSiteKey" json:"captchaSiteKey"`
 	VapidKey     string    `yaml:"vapidKey" json:"vapidKey"`
-}
-
-// Load loads config from given path
-func (c *Config) Load(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Fatal("failed to open configuration file:", err)
-		return err
-	}
-	defer f.Close()
-
-	err = yaml.NewDecoder(f).Decode(&c)
-	if err != nil {
-		log.Fatal("failed to load configuration file:", err)
-		return err
-	}
-
-	return nil
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
 
-	"github.com/totegamma/concurrent/core"
+	"github.com/concrnt/concrnt/core"
 )
 
 // Repository is the interface for message repository
@@ -246,6 +246,7 @@ func (r *repository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// Clean deletes all messages authored by the specified ccid.
 func (r *repository) Clean(ctx context.Context, ccid string) error {
 	ctx, span := tracer.Start(ctx, "Message.Repository.Clean")
 	defer span.End()

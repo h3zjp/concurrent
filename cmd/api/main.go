@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,35 +20,30 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/totegamma/concurrent"
-	"github.com/totegamma/concurrent/client"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/x/ack"
-	"github.com/totegamma/concurrent/x/association"
-	"github.com/totegamma/concurrent/x/auth"
-	"github.com/totegamma/concurrent/x/domain"
-	"github.com/totegamma/concurrent/x/entity"
-	"github.com/totegamma/concurrent/x/job"
-	"github.com/totegamma/concurrent/x/key"
-	"github.com/totegamma/concurrent/x/message"
-	"github.com/totegamma/concurrent/x/notification"
-	"github.com/totegamma/concurrent/x/profile"
-	"github.com/totegamma/concurrent/x/store"
-	"github.com/totegamma/concurrent/x/subscription"
-	"github.com/totegamma/concurrent/x/timeline"
-	"github.com/totegamma/concurrent/x/userkv"
+	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/util"
+	"github.com/concrnt/concrnt/x/ack"
+	"github.com/concrnt/concrnt/x/association"
+	"github.com/concrnt/concrnt/x/auth"
+	"github.com/concrnt/concrnt/x/domain"
+	"github.com/concrnt/concrnt/x/entity"
+	"github.com/concrnt/concrnt/x/job"
+	"github.com/concrnt/concrnt/x/key"
+	"github.com/concrnt/concrnt/x/message"
+	"github.com/concrnt/concrnt/x/notification"
+	"github.com/concrnt/concrnt/x/profile"
+	"github.com/concrnt/concrnt/x/store"
+	"github.com/concrnt/concrnt/x/subscription"
+	"github.com/concrnt/concrnt/x/timeline"
+	"github.com/concrnt/concrnt/x/userkv"
 
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
 	"gorm.io/plugin/opentelemetry/tracing"
 )
@@ -70,10 +66,10 @@ func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 var (
-	version      = "v1.6.10"
-	buildMachine = "AlmaLinux release 9.5 (Teal Serval)"
-	buildTime    = "Tue Mar 4 22:05:00 JST 2025"
-	goVersion    = "go1.22.4 linux/amd64"
+	version      = "v1.7.4"
+	buildMachine = "AlmaLinux release 9.6 (Teal Serval)"
+	buildTime    = "Sun Aug 24 20:50:00 UTC 2025"
+	goVersion    = "go1.24.2 linux/amd64"
 )
 
 func main() {
@@ -89,13 +85,25 @@ func main() {
 	e := echo.New()
 	e.HidePort = true
 	e.HideBanner = true
-	config := Config{}
-	configPath := os.Getenv("CONCRNT_CONFIG")
-	if configPath == "" {
-		configPath = "/etc/concrnt/config/config.yaml"
+
+	configPaths := []string{}
+	configPath := os.Getenv("CONCRNT_CONFIG") // for backward compatibility
+	if configPath != "" {
+		configPaths = append(configPaths, configPath)
 	}
 
-	err := config.Load(configPath)
+	additional_configs := os.Getenv("CONCRNT_CONFIGS")
+	if additional_configs != "" {
+		for v := range strings.SplitSeq(additional_configs, ":") {
+			configPaths = append(configPaths, v)
+		}
+	}
+
+	if len(configPaths) == 0 {
+		configPaths = []string{"/etc/concrnt/config/config.yaml"}
+	}
+
+	config, err := util.LoadMultipleYamlFiles[Config](configPaths)
 	if err != nil {
 		slog.Error("Failed to load config: ", slog.String("error", err.Error()))
 	}
@@ -104,8 +112,14 @@ func main() {
 
 	slog.Info(fmt.Sprintf("Config loaded! I am: %s", conconf.CCID))
 
+	port := "192.168.10.3:8010"
+	envport := os.Getenv("CC_API_PORT")
+	if envport != "" {
+		port = ":" + envport
+	}
+
 	if config.Server.EnableTrace {
-		cleanup, err := setupTraceProvider(config.Server.TraceEndpoint, config.Concrnt.FQDN+"/ccapi", version)
+		cleanup, err := util.SetupTraceProvider(config.Server.TraceEndpoint, config.Concrnt.FQDN+"/ccapi", version)
 		if err != nil {
 			panic(err)
 		}
@@ -215,13 +229,14 @@ func main() {
 	mc := memcache.New(config.Server.MemcachedAddr)
 	defer mc.Close()
 
-	client := client.NewClient()
+	client := client.NewClient(conconf.FQDN)
+	client.RegisterHostRemap(conconf.FQDN, config.Server.GatewayAddr, false)
 	client.SetUserAgent("CCAPI", version)
 	timelineKeeper := timeline.NewKeeper(rdb, mc, client, conconf)
 
 	globalPolicy := concurrent.GetDefaultGlobalPolicy()
 
-	policy := concurrent.SetupPolicyService(rdb, globalPolicy, conconf)
+	policy := concurrent.SetupPolicyService(rdb, client, globalPolicy, conconf)
 
 	domainService := concurrent.SetupDomainService(db, client, conconf)
 	domainHandler := domain.NewHandler(domainService)
@@ -310,6 +325,9 @@ func main() {
 	apiV1.GET("/entities", entityHandler.List)
 	apiV1.GET("/entity/meta", entityHandler.GetMeta, auth.Restrict(auth.ISREGISTERED))
 	apiV1.PUT("/entity/meta", entityHandler.UpdateMeta, auth.Restrict(auth.ISREGISTERED))
+
+	// ack
+	apiV1.GET("/ack/:from/:to", ackHandler.Get)
 
 	// message
 	apiV1.GET("/message/:id", messageHandler.Get)
@@ -466,7 +484,7 @@ func main() {
 
 	e.GET("/cc-info", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, core.CCInfo{
-			Name:    "github.com/totegamma/concurrent/ccapi",
+			Name:    "github.com/concrnt/concrnt/ccapi",
 			Version: version,
 		})
 	})
@@ -475,51 +493,5 @@ func main() {
 	jobReactor.Start(context.Background())
 	notificationReactor.Start(context.Background())
 
-	port := "192.168.10.14:8010"
-	envport := os.Getenv("CC_API_PORT")
-	if envport != "" {
-		port = ":" + envport
-	}
 	e.Logger.Fatal(e.Start(port))
-}
-
-func setupTraceProvider(endpoint string, serviceName string, serviceVersion string) (func(), error) {
-
-	exporter, err := otlptracehttp.New(
-		context.Background(),
-		otlptracehttp.WithEndpoint(endpoint),
-		otlptracehttp.WithInsecure(),
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	resource := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceNameKey.String(serviceName),
-		semconv.ServiceVersionKey.String(serviceVersion),
-	)
-
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithResource(resource),
-	)
-	otel.SetTracerProvider(tracerProvider)
-
-	propagator := propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	)
-	otel.SetTextMapPropagator(propagator)
-
-	cleanup := func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		if err := tracerProvider.Shutdown(ctx); err != nil {
-			slog.Error(fmt.Sprintf("Failed to shutdown tracer provider: %v", err))
-		}
-	}
-	return cleanup, nil
 }

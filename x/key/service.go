@@ -2,11 +2,10 @@ package key
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
-	"github.com/totegamma/concurrent/core"
+	"github.com/concrnt/concrnt/core"
 )
 
 type service struct {
@@ -108,70 +107,8 @@ func (s *service) Revoke(ctx context.Context, mode core.CommitMode, payload, sig
 	return revoked, nil
 }
 
-func ValidateKeyResolution(keys []core.Key) (string, error) {
-
-	var rootKey string
-	var nextKey string
-	for _, key := range keys {
-		if (nextKey != "") && (nextKey != key.ID) {
-			return "", fmt.Errorf("Key %s is not a child of %s", key.ID, nextKey)
-		}
-
-		signature, err := hex.DecodeString(key.EnactSignature)
-		if err != nil {
-			return "", err
-		}
-		err = core.VerifySignature([]byte(key.EnactDocument), signature, key.Parent)
-		if err != nil {
-			return "", err
-		}
-
-		var enact core.EnactDocument
-		err = json.Unmarshal([]byte(key.EnactDocument), &enact)
-		if err != nil {
-			return "", err
-		}
-
-		if core.IsCCID(key.Parent) {
-			if enact.Signer != key.Parent {
-				return "", fmt.Errorf("enact signer is not matched with the parent")
-			}
-		} else {
-			if enact.KeyID != key.Parent {
-				return "", fmt.Errorf("enact keyID is not matched with the parent")
-			}
-		}
-
-		if enact.Target != key.ID {
-			return "", fmt.Errorf("KeyID in payload is not matched with the keyID")
-		}
-
-		if enact.Parent != key.Parent {
-			return "", fmt.Errorf("Parent in payload is not matched with the parent")
-		}
-
-		if enact.Root != key.Root {
-			return "", fmt.Errorf("Root in payload is not matched with the root")
-		}
-
-		if rootKey == "" {
-			rootKey = key.Root
-		} else {
-			if rootKey != key.Root {
-				return "", fmt.Errorf("Root is not matched with the previous key")
-			}
-		}
-
-		if key.RevokeDocument != nil {
-			return "", fmt.Errorf("Key %s is revoked", key.ID)
-		}
-
-		nextKey = key.Parent
-	}
-
-	return rootKey, nil
-}
-
+// ResolveSubkey resolves a subkey (CKID) to its root key (CCID) by traversing the key hierarchy.
+// It also validates that each key in the chain is not revoked.
 func (s *service) ResolveSubkey(ctx context.Context, keyID string) (string, error) {
 	ctx, span := tracer.Start(ctx, "Key.Service.ResolveSubkey")
 	defer span.End()
@@ -196,6 +133,7 @@ func (s *service) ResolveSubkey(ctx context.Context, keyID string) (string, erro
 	return rootKey, nil
 }
 
+// GetRemoteKeyResolution retrieves the key resolution chain for a key ID from a remote domain.
 func (s *service) GetRemoteKeyResolution(ctx context.Context, remote string, keyID string) ([]core.Key, error) {
 	ctx, span := tracer.Start(ctx, "Key.Service.GetRemoteKey")
 	defer span.End()
@@ -203,6 +141,7 @@ func (s *service) GetRemoteKeyResolution(ctx context.Context, remote string, key
 	return s.repository.GetRemoteKeyResolution(ctx, remote, keyID)
 }
 
+// GetKeyResolution retrieves the key resolution chain for a local key ID (CKID) up to its root (CCID).
 func (s *service) GetKeyResolution(ctx context.Context, keyID string) ([]core.Key, error) {
 	ctx, span := tracer.Start(ctx, "Key.Service.GetKeyResolution")
 	defer span.End()
@@ -229,6 +168,7 @@ func (s *service) GetKeyResolution(ctx context.Context, keyID string) ([]core.Ke
 	}
 }
 
+// GetAllKeys retrieves all keys associated with a specific owner (root CCID).
 func (s *service) GetAllKeys(ctx context.Context, owner string) ([]core.Key, error) {
 	ctx, span := tracer.Start(ctx, "Key.Service.GetAllKeys")
 	defer span.End()
@@ -236,6 +176,7 @@ func (s *service) GetAllKeys(ctx context.Context, owner string) ([]core.Key, err
 	return s.repository.GetAll(ctx, owner)
 }
 
+// Clean deletes all keys associated with a specific owner (root CCID).
 func (s *service) Clean(ctx context.Context, ccid string) error {
 	ctx, span := tracer.Start(ctx, "Key.Service.Clean")
 	defer span.End()
@@ -243,6 +184,7 @@ func (s *service) Clean(ctx context.Context, ccid string) error {
 	return s.repository.Clean(ctx, ccid)
 }
 
+// IsKeyValid checks if a key is currently valid (i.e., not revoked).
 func IsKeyValid(ctx context.Context, key core.Key) bool {
 	return key.RevokeDocument == nil
 }

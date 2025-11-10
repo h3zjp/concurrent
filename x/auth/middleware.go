@@ -12,11 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/x/jwt"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/x/jwt"
-	"github.com/totegamma/concurrent/x/key"
 	"github.com/xinguang/go-recaptcha"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -31,6 +30,9 @@ const (
 	ISREGISTERED
 )
 
+// IdentifyIdentity is a middleware that identifies the requester based on Authorization header and Passport header.
+// It extracts identity information (CCID, CKID, domain, tags, keychain) and sets it in the context.
+// It also performs basic validation like JWT signature check, domain blocking, and global policy checks.
 func (s *service) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx, span := tracer.Start(c.Request().Context(), "Auth.Service.IdentifyIdentity")
@@ -100,19 +102,6 @@ func (s *service) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
 				goto skipCheckPassport
 			}
 
-			if len(passportDoc.Keys) > 0 {
-				resolved, err := key.ValidateKeyResolution(passportDoc.Keys)
-				if err != nil {
-					span.RecordError(errors.Wrap(err, "failed to validate key resolution"))
-					goto skipCheckPassport
-				}
-
-				if resolved != passportDoc.Entity.ID {
-					span.RecordError(fmt.Errorf("Signer is not matched with the resolved signer. expected: %s, actual: %s", resolved, passportDoc.Entity.ID))
-					goto skipCheckPassport
-				}
-			}
-
 			entity := passportDoc.Entity
 			updated, err := s.entity.Affiliation(ctx, core.CommitModeExecute, entity.AffiliationDocument, entity.AffiliationSignature, "")
 			if err != nil {
@@ -153,7 +142,7 @@ func (s *service) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
 				goto skipCheckAuthorization
 			}
 
-			claims, err := jwt.Validate(token)
+			header, claims, err := jwt.Validate(token)
 			if err != nil {
 				span.RecordError(errors.Wrap(err, "jwt validation failed"))
 				goto skipCheckAuthorization
@@ -169,26 +158,39 @@ func (s *service) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
 				goto skipCheckAuthorization
 			}
 
+			keyID := header.KeyID
+			if keyID == "" {
+				keyID = claims.Issuer
+			}
+
 			var ccid string
-			if core.IsCCID(claims.Issuer) {
-				ccid = claims.Issuer
-			} else if core.IsCKID(claims.Issuer) {
-				if providedKeyChain, ok := ctx.Value(core.RequesterKeychainKey).([]core.Key); ok {
-					ccid, err = key.ValidateKeyResolution(providedKeyChain)
+			if core.IsCCID(keyID) {
+				ccid = keyID
+			} else if core.IsCKID(keyID) {
+				if providedKeyChain, ok := ctx.Value(core.RequesterKeychainKey).([]core.Key); ok { // remote user
+					ccid, err = core.ValidateKeyResolution(providedKeyChain, keyID)
 					if err != nil {
 						span.RecordError(errors.Wrap(err, "failed to validate key resolution"))
 						goto skipCheckAuthorization
 					}
-				} else {
 
-					keys, err := s.key.GetKeyResolution(ctx, claims.Issuer)
+					/*
+						if ccid != claims.Issuer {
+							span.RecordError(fmt.Errorf("resolved ccid is not matched with the issuer"))
+							goto skipCheckAuthorization
+						}
+					*/
+
+				} else { // local user
+
+					keys, err := s.key.GetKeyResolution(ctx, keyID)
 					if err != nil {
 						span.RecordError(errors.Wrap(err, "failed to get key resolution"))
 						goto skipCheckAuthorization
 					}
 					ctx = context.WithValue(ctx, core.RequesterKeychainKey, keys)
 
-					ccid, err = s.key.ResolveSubkey(ctx, claims.Issuer)
+					ccid, err = s.key.ResolveSubkey(ctx, keyID)
 					if err != nil {
 						span.RecordError(errors.Wrap(err, "failed to resolve subkey"))
 						goto skipCheckAuthorization
@@ -296,6 +298,9 @@ func (s *service) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+// ReceiveGatewayAuthPropagation is a middleware that receives authentication information propagated from a gateway via HTTP headers.
+// It extracts requester type, ID, tags, domain, keychain, etc., and sets them in the context.
+// This is typically used in internal services that sit behind an authenticating gateway.
 func ReceiveGatewayAuthPropagation(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		ctx, span := tracer.Start(c.Request().Context(), "Auth.Service.ReceiveGatewayAuthPropagation")
@@ -371,6 +376,8 @@ func ReceiveGatewayAuthPropagation(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+// Restrict is a middleware factory that returns a middleware to restrict access based on the requester's principal type.
+// It checks the requester type and tags stored in the context against the required principal level (e.g., ISADMIN, ISLOCAL).
 func Restrict(principal Principal) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -427,6 +434,9 @@ func Restrict(principal Principal) echo.MiddlewareFunc {
 	}
 }
 
+// Recaptcha is a middleware factory that returns a middleware to verify reCAPTCHA challenges.
+// It expects the challenge response in the "captcha" header and uses the provided validator.
+// If verification is successful, it sets a flag in the context.
 func Recaptcha(validator *recaptcha.ReCAPTCHA) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -452,6 +462,10 @@ func Recaptcha(validator *recaptcha.ReCAPTCHA) echo.MiddlewareFunc {
 	}
 }
 
+// RateLimiter is a middleware factory that returns a middleware for rate limiting requests based on configuration.
+// It uses a token bucket algorithm implemented with Redis.
+// Configuration defines bucket size and refill rate per route/method or globally.
+// It identifies requesters by CCID if available, otherwise by IP address.
 func (s *service) RateLimiter(configMap core.RateLimitConfigMap) echo.MiddlewareFunc {
 
 	routerEcho := echo.New()

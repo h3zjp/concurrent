@@ -1,18 +1,17 @@
 package key
 
 import (
-	"context"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/stretchr/testify/assert"
-	"github.com/totegamma/concurrent/client"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/internal/testutil"
 	"testing"
 	"time"
 )
 
 func TestRepository(t *testing.T) {
 
-	var ctx = context.Background()
+	var ctx = t.Context()
 
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -20,7 +19,7 @@ func TestRepository(t *testing.T) {
 	mc, cleanup_mc := testutil.CreateMC()
 	defer cleanup_mc()
 
-	client := client.NewClient()
+	client := client.NewClient("localhost")
 	repo := NewRepository(db, mc, client)
 
 	newkey := core.Key{

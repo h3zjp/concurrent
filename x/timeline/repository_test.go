@@ -1,24 +1,24 @@
 package timeline
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/client/mock"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/core/mock"
+	"github.com/concrnt/concrnt/internal/testutil"
+	"github.com/concrnt/concrnt/x/timeline/mock"
 	"github.com/stretchr/testify/assert"
-	"github.com/totegamma/concurrent/client/mock"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/core/mock"
-	"github.com/totegamma/concurrent/internal/testutil"
-	"github.com/totegamma/concurrent/x/timeline/mock"
 	"go.uber.org/mock/gomock"
 )
 
-var ctx = context.Background()
-
 func TestCreateItem(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -111,6 +111,8 @@ func TestCreateItem(t *testing.T) {
 }
 
 func TestLoadChunkBodies(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -136,12 +138,11 @@ func TestLoadChunkBodies(t *testing.T) {
 	mockClient := mock_client.NewMockClient(ctrl)
 	mockClient.EXPECT().GetChunkBodies(
 		gomock.Any(),
-		"remote.example.com",
 		map[string]string{
 			"t00000000000000000000000000@remote.example.com": pivotEpoch,
 			"t11111111111111111111111111@remote.example.com": pivotEpoch,
 		},
-		nil,
+		&client.Options{Resolver: "remote.example.com"},
 	).Return(
 		map[string]core.Chunk{
 			"t00000000000000000000000000@remote.example.com": {
@@ -171,11 +172,10 @@ func TestLoadChunkBodies(t *testing.T) {
 	)
 	mockClient.EXPECT().GetChunkBodies(
 		gomock.Any(),
-		"remote.example.com",
 		map[string]string{
 			"t11111111111111111111111111@remote.example.com": pivotEpoch,
 		},
-		nil,
+		&client.Options{Resolver: "remote.example.com"},
 	).Return(
 		map[string]core.Chunk{
 			"t11111111111111111111111111@remote.example.com": {
@@ -219,7 +219,7 @@ func TestLoadChunkBodies(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Itemを追加
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		resourceID := fmt.Sprintf("m%026d", i)
 		_, err = repo.CreateItem(ctx, core.TimelineItem{
 			ResourceID: resourceID,
@@ -282,6 +282,8 @@ func TestLoadChunkBodies(t *testing.T) {
 }
 
 func TestLookupChunkItrs(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -307,13 +309,12 @@ func TestLookupChunkItrs(t *testing.T) {
 	mockClient := mock_client.NewMockClient(ctrl)
 	mockClient.EXPECT().GetChunkItrs(
 		gomock.Any(),
-		"remote.example.com",
 		[]string{
 			"t00000000000000000000000000@remote.example.com",
 			"t11111111111111111111111111@remote.example.com",
 		},
 		pivotEpoch,
-		gomock.Any(),
+		&client.Options{Resolver: "remote.example.com"},
 	).Return(
 		map[string]string{
 			"t00000000000000000000000000@remote.example.com": pivotEpoch,
@@ -439,6 +440,8 @@ func TestLookupChunkItrs(t *testing.T) {
 }
 
 func TestLoadRemoteBodies(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -464,12 +467,11 @@ func TestLoadRemoteBodies(t *testing.T) {
 	mockClient := mock_client.NewMockClient(ctrl)
 	mockClient.EXPECT().GetChunkBodies(
 		gomock.Any(),
-		"remote.example.com",
 		map[string]string{
 			"t00000000000000000000000000@remote.example.com": pivotEpoch,
 			"t11111111111111111111111111@remote.example.com": pivotEpoch,
 		},
-		nil,
+		&client.Options{Resolver: "remote.example.com"},
 	).Return(
 		map[string]core.Chunk{
 			"t00000000000000000000000000@remote.example.com": {
@@ -557,6 +559,8 @@ func TestLoadRemoteBodies(t *testing.T) {
 }
 
 func TestLookupRemoteItrs(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -582,13 +586,12 @@ func TestLookupRemoteItrs(t *testing.T) {
 	mockClient := mock_client.NewMockClient(ctrl)
 	mockClient.EXPECT().GetChunkItrs(
 		gomock.Any(),
-		"remote.example.com",
 		[]string{
 			"t00000000000000000000000000@remote.example.com",
 			"t11111111111111111111111111@remote.example.com",
 		},
 		pivotEpoch,
-		gomock.Any(),
+		&client.Options{Resolver: "remote.example.com"},
 	).Return(
 		map[string]string{
 			"t00000000000000000000000000@remote.example.com": pivotEpoch,
@@ -649,6 +652,8 @@ func TestLookupRemoteItrs(t *testing.T) {
 }
 
 func TestLookupLocalItrs(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -753,6 +758,8 @@ func TestLookupLocalItrs(t *testing.T) {
 }
 
 func TestLoadLocalBody(t *testing.T) {
+	ctx := t.Context()
+
 	var cleanup_db func()
 	db, cleanup_db := testutil.CreateDB()
 	defer cleanup_db()
@@ -803,7 +810,7 @@ func TestLoadLocalBody(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Itemを追加
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		resourceID := fmt.Sprintf("m%026d", i)
 		_, err = repo.CreateItem(ctx, core.TimelineItem{
 			ResourceID: resourceID,
@@ -852,7 +859,7 @@ func TestLoadLocalBody(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Itemを追加
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		resourceID := fmt.Sprintf("m%026d", i)
 		_, err = repo.CreateItem(ctx, core.TimelineItem{
 			ResourceID: resourceID,

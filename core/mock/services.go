@@ -15,9 +15,9 @@ import (
 	reflect "reflect"
 	time "time"
 
+	core "github.com/concrnt/concrnt/core"
 	websocket "github.com/gorilla/websocket"
 	echo "github.com/labstack/echo/v4"
-	core "github.com/totegamma/concurrent/core"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -57,6 +57,21 @@ func (m *MockAckService) Ack(ctx context.Context, mode core.CommitMode, document
 func (mr *MockAckServiceMockRecorder) Ack(ctx, mode, document, signature any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Ack", reflect.TypeOf((*MockAckService)(nil).Ack), ctx, mode, document, signature)
+}
+
+// Get mocks base method.
+func (m *MockAckService) Get(ctx context.Context, from, to string) (core.Ack, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Get", ctx, from, to)
+	ret0, _ := ret[0].(core.Ack)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Get indicates an expected call of Get.
+func (mr *MockAckServiceMockRecorder) Get(ctx, from, to any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Get", reflect.TypeOf((*MockAckService)(nil).Get), ctx, from, to)
 }
 
 // GetAcker mocks base method.
@@ -284,10 +299,10 @@ func (mr *MockAssociationServiceMockRecorder) GetCountsBySchema(ctx, messageID a
 }
 
 // GetCountsBySchemaAndVariant mocks base method.
-func (m *MockAssociationService) GetCountsBySchemaAndVariant(ctx context.Context, messageID, schema string) (map[string]int64, error) {
+func (m *MockAssociationService) GetCountsBySchemaAndVariant(ctx context.Context, messageID, schema string) (*core.OrderedKVMap[int64], error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetCountsBySchemaAndVariant", ctx, messageID, schema)
-	ret0, _ := ret[0].(map[string]int64)
+	ret0, _ := ret[0].(*core.OrderedKVMap[int64])
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }

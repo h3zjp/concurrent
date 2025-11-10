@@ -6,7 +6,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"go.opentelemetry.io/otel"
 
-	"github.com/totegamma/concurrent/core"
+	"github.com/concrnt/concrnt/core"
 )
 
 var tracer = otel.Tracer("job")
@@ -27,6 +27,7 @@ func NewHandler(service core.JobService) Handler {
 	}
 }
 
+// List returns a list of jobs owned by the requester.
 func (h *handler) List(c echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "Job.Handler.List")
 	defer span.End()
@@ -42,9 +43,10 @@ func (h *handler) List(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"content": jobs})
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": jobs})
 }
 
+// Create creates a new job owned by the requester.
 func (h *handler) Create(c echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "Job.Handler.Create")
 	defer span.End()
@@ -67,9 +69,10 @@ func (h *handler) Create(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"content": job})
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": job})
 }
 
+// Cancel cancels a job by its ID.
 func (h *handler) Cancel(c echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "Job.Handler.Cancel")
 	defer span.End()
@@ -81,5 +84,5 @@ func (h *handler) Cancel(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": err.Error()})
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"content": job})
+	return c.JSON(http.StatusOK, echo.Map{"status": "ok", "content": job})
 }

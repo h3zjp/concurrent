@@ -11,10 +11,10 @@ import (
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/totegamma/concurrent/cdid"
-	"github.com/totegamma/concurrent/client"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/x/policy"
+	"github.com/concrnt/concrnt/cdid"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/x/policy"
 )
 
 type service struct {
@@ -143,7 +143,7 @@ func (s *service) isMessagePublic(ctx context.Context, message core.Message) (bo
 	return true, nil
 }
 
-// Get returns a message by ID
+// GetAsGuest returns a message by ID, performing policy checks for guest access.
 func (s *service) GetAsGuest(ctx context.Context, id string) (core.Message, error) {
 	ctx, span := tracer.Start(ctx, "Message.Service.GetAsGuest")
 	defer span.End()
@@ -167,6 +167,7 @@ func (s *service) GetAsGuest(ctx context.Context, id string) (core.Message, erro
 	return message, nil
 }
 
+// GetAsUser returns a message by ID, performing policy checks for the given requester entity.
 func (s *service) GetAsUser(ctx context.Context, id string, requester core.Entity) (core.Message, error) {
 	ctx, span := tracer.Start(ctx, "Message.Service.GetAsUser")
 	defer span.End()
@@ -452,7 +453,7 @@ func (s *service) Create(ctx context.Context, mode core.CommitMode, document str
 					timelineItem.CDate = doc.SignedAt
 				}
 
-				posted, err := s.timeline.PostItem(ctx, timeline, timelineItem, sendDocument, sendSignature)
+				posted, err := s.timeline.PostItem(ctx, timeline, timelineItem, document, sendSignature)
 				if err != nil {
 					span.RecordError(errors.Wrap(err, "failed to post item"))
 					continue
@@ -612,6 +613,7 @@ func (s *service) Delete(ctx context.Context, mode core.CommitMode, document, si
 	return deleteTarget, affected, err
 }
 
+// Clean deletes all messages authored by the specified ccid.
 func (s *service) Clean(ctx context.Context, ccid string) error {
 	ctx, span := tracer.Start(ctx, "Message.Service.Clean")
 	defer span.End()

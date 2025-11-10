@@ -1,16 +1,15 @@
 package timeline
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"testing"
 
+	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/core/mock"
+	"github.com/concrnt/concrnt/x/timeline/mock"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	"github.com/totegamma/concurrent/core"
-	"github.com/totegamma/concurrent/core/mock"
-	"github.com/totegamma/concurrent/x/timeline/mock"
 	"go.uber.org/mock/gomock"
 )
 
@@ -95,7 +94,7 @@ func TestGetRecentItemsSimple(t *testing.T) {
 		},
 	)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	items, err := service.GetRecentItems(ctx, []string{"t00000000000000000000000000"}, pivotTime, 16)
 	assert.NoError(t, err)
@@ -182,7 +181,7 @@ func TestGetRecentItemsLoadMore(t *testing.T) {
 		},
 	)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	items, err := service.GetRecentItems(ctx, []string{"t00000000000000000000000000"}, pivotTime, 16)
 	assert.NoError(t, err)
@@ -414,7 +413,7 @@ func TestGetRecentItemsWide(t *testing.T) {
 		},
 	)
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	items, err := service.GetRecentItems(
 		ctx,
