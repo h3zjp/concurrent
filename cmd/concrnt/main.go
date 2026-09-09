@@ -40,9 +40,9 @@ import (
 )
 
 var (
-	version      = "v1.10.29"
+	version      = "v1.11.2"
 	buildMachine = "AlmaLinux release 9.8 (Olive Jaguar)"
-	buildTime    = "Wed Sep 7 15:39:00 JST 2026"
+	buildTime    = "Wed Sep 9 12:45:00 JST 2026"
 	goVersion    = "go1.22.4 linux/amd64"
 )
 

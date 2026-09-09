@@ -1,9 +1,8 @@
-/concrnt
-/conctl
+/cmd/concrnt/concrnt
+/cmd/conctl/conctl
 tmp
 _composeData
 _etc
 .codex
 .claude
 references
-ecosystem.config.js
