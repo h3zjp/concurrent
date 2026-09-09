@@ -95,6 +95,27 @@ func (r *ResidenceRepository) DeleteMeta(ctx context.Context, ccid string) error
 	return nil
 }
 
+// MarkCommitLogsGcCandidateByOwner flags every commit log owned by the given
+// ccid as a GC candidate. Every commit has exactly one owner (an ack between
+// two local users is two commits: the ack owned by the acker and the acked
+// owned by the target), so nothing another user holds is touched. Idempotent.
+func (r *ResidenceRepository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
+	ctx, span := tracer.Start(ctx, "ResidenceRepository.MarkCommitLogsGcCandidateByOwner")
+	defer span.End()
+
+	err := r.db.WithContext(ctx).
+		Model(&models.CommitLog{}).
+		Where("owner = ?", owner).
+		Where("NOT gc_candidate").
+		Update("gc_candidate", true).Error
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+
+	return nil
+}
+
 func (r *ResidenceRepository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByCCID")
 	defer span.End()
