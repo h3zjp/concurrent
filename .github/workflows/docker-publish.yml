@@ -3,6 +3,8 @@ name: Docker
 on:
   push:
     tags: [ 'v*.*.*' ]
+    branches:
+      - main
 
 env:
   REGISTRY: ghcr.io
@@ -13,18 +15,18 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - ccgateway
-          - ccapi
+          - concrnt
+          - k8s-elector
         arch:
           - ubuntu-24.04
           - ubuntu-24.04-arm
         include:
-          - target: ccgateway
-            file: ./cmd/gateway/Dockerfile
-            image: ghcr.io/concrnt/ccgateway
-          - target: ccapi
-            file: ./cmd/api/Dockerfile
-            image: ghcr.io/concrnt/ccapi
+          - target: concrnt
+            file: ./cmd/concrnt/Dockerfile
+            image: ghcr.io/concrnt/concrnt
+          - target: k8s-elector
+            file: ./cmd/k8s-elector/Dockerfile
+            image: ghcr.io/concrnt/k8s-elector
 
     runs-on: ${{ matrix.arch }}
 
@@ -95,10 +97,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: ccgateway
-            image: ghcr.io/concrnt/ccgateway
-          - target: ccapi
-            image: ghcr.io/concrnt/ccapi
+          - target: concrnt
+            file: ./cmd/concrnt/Dockerfile
+            image: ghcr.io/concrnt/concrnt
+          - target: k8s-elector
+            file: ./cmd/k8s-elector/Dockerfile
+            image: ghcr.io/concrnt/k8s-elector
 
     permissions:
       contents: read
@@ -143,4 +147,3 @@ jobs:
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ matrix.image }}@sha256:%s ' *)
-

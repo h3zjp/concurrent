@@ -17,11 +17,11 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 
-ingester:
-  max_block_duration: 5m
-compactor:
-  compaction:
-    block_retention: 1h
+# ingester:
+#   max_block_duration: 5m
+# compactor:
+#   compaction:
+#     block_retention: 1h
 
 metrics_generator:
   registry:
@@ -29,7 +29,7 @@ metrics_generator:
       source: tempo
       cluster: docker-compose
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/lib/tempo/generator/wal
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
@@ -38,9 +38,9 @@ storage:
   trace:
     backend: local
     wal:
-      path: /tmp/tempo/wal
+      path: /var/lib/tempo/wal
     local:
-      path: /tmp/tempo/blocks
+      path: /var/lib/tempo/blocks
 
 overrides:
   defaults:
@@ -49,4 +49,3 @@ overrides:
 
 usage_report:
   reporting_enabled: false
-

@@ -1,830 +1,1089 @@
-//go:generate go run go.uber.org/mock/mockgen -source=client.go -destination=mock/client.go
 package client
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
-	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/concrnt/concrnt/core"
-	"github.com/gorilla/websocket"
-	"github.com/patrickmn/go-cache"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+
+	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/schemas"
+	"github.com/gorilla/websocket"
+	"github.com/patrickmn/go-cache"
 )
+
+var tracer = otel.Tracer("client")
 
 const (
 	defaultTimeout = 3 * time.Second
 	maxFailCount   = 23 // max 10 minutes
 )
 
-var tracer = otel.Tracer("client")
-
-type Client interface {
-	SetUserAgent(software, version string)
-	RegisterHostRemap(host string, remap string, useHttps bool)
-
-	Commit(ctx context.Context, domain, body string, response any, opts *Options) (*http.Response, error)
-	ConnectWebsocket(ctx context.Context, domain string, path string) (*websocket.Conn, error)
-
-	GetEntity(ctx context.Context, address string, opts *Options) (core.Entity, error)
-	GetMessage(ctx context.Context, id string, opts *Options) (core.Message, error)
-	GetAssociation(ctx context.Context, id string, opts *Options) (core.Association, error)
-	GetProfile(ctx context.Context, address string, opts *Options) (core.Profile, error)
-	GetTimeline(ctx context.Context, id string, opts *Options) (core.Timeline, error)
-	GetChunks(ctx context.Context, timelines []string, queryTime time.Time, opts *Options) (map[string]core.Chunk, error)
-	GetKey(ctx context.Context, id string, opts *Options) ([]core.Key, error)
-	GetDomain(ctx context.Context, domain string, opts *Options) (core.Domain, error)
-	GetChunkItrs(ctx context.Context, timelines []string, epoch string, opts *Options) (map[string]string, error)
-	GetChunkBodies(ctx context.Context, query map[string]string, opts *Options) (map[string]core.Chunk, error)
-	GetRetracted(ctx context.Context, timelines []string, opts *Options) (map[string][]string, error)
-	GetAck(ctx context.Context, from, to string, opts *Options) (core.Ack, error)
-}
-
-type remapRecord struct {
-	Remap    string
-	UseHttps bool
-}
-
-type client struct {
+type Client struct {
 	client          *http.Client
 	cache           *cache.Cache
 	lastFailed      map[string]time.Time
 	failCount       map[string]int
+	onlineMu        sync.RWMutex
 	userAgent       string
-	hostRemap       map[string]remapRecord
 	defaultResolver string
+	remappings      map[string]*url.URL
 }
 
-func NewClient(defaultResolver string) Client {
+func New(defaultResolver string) *Client {
 	httpClient := http.Client{
 		Timeout: defaultTimeout,
 	}
-	client := &client{
+
+	c := &Client{
 		client:          &httpClient,
-		cache:           cache.New(1*time.Hour, 3*time.Hour),
+		cache:           cache.New(10*time.Minute, 15*time.Minute),
 		lastFailed:      make(map[string]time.Time),
 		failCount:       make(map[string]int),
 		defaultResolver: defaultResolver,
+		remappings:      make(map[string]*url.URL),
 	}
-	httpClient.Transport = client
-	client.hostRemap = make(map[string]remapRecord)
-	go client.UpKeeper()
-	return client
+	httpClient.Transport = otelhttp.NewTransport(c)
+	go c.UpKeeper()
+	return c
 }
 
-type Options struct {
-	Resolver  string
-	AuthToken string
-	Passport  string
-	Cache     string
-}
-
-func (c *client) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Set("User-Agent", c.userAgent)
-
-	// remap host
-	if remap, ok := c.hostRemap[req.Host]; ok {
-		req.Host = remap.Remap
-		req.URL.Host = remap.Remap
-		if remap.UseHttps {
-			req.URL.Scheme = "https"
-		} else {
-			req.URL.Scheme = "http"
-		}
-	}
-
-	return http.DefaultTransport.RoundTrip(req)
-}
-
-func (c *client) SetUserAgent(software, version string) {
+func (c *Client) SetUserAgent(software, version string) {
 	c.userAgent = fmt.Sprintf("%s/%s (Concrnt)", software, version)
 }
 
-func (c *client) RegisterHostRemap(host string, remap string, useHttps bool) {
-	c.hostRemap[host] = remapRecord{
-		Remap:    remap,
-		UseHttps: useHttps,
+func (c *Client) AddHostRemapping(host string, target string) {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		slog.Warn("Failed to parse remapping target "+target, "error", err)
+		return
 	}
+	// url.Parse accepts values like "" or "concrnt:8000" (scheme "concrnt",
+	// empty host) without error; installing such a remap breaks every request
+	// to the remapped host
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		slog.Warn("Ignoring remapping target " + target + ": scheme must be http or https (e.g. http://concrnt:8000)")
+		return
+	}
+	if parsed.Host == "" {
+		slog.Warn("Ignoring remapping target " + target + ": host is empty")
+		return
+	}
+	c.remappings[host] = parsed
 }
 
-func (c *client) IsOnline(domain string) bool {
-	lastfailed, ok := c.lastFailed[domain]
+func (c *Client) IsOnline(domain string) bool {
+	c.onlineMu.RLock()
+	defer c.onlineMu.RUnlock()
+
+	lastFailed, ok := c.lastFailed[domain]
 	if !ok {
 		return true
 	}
-	if lastfailed.IsZero() {
+	if lastFailed.IsZero() {
 		return true
 	}
 	return false
 }
 
-func (c *client) UpKeeper() {
+func (c *Client) UpKeeper() {
 	ctx := context.Background()
-	for range time.Tick(100 * time.Millisecond) {
-		for domain, lastFailed := range c.lastFailed {
-			// exponential backoff (max 10 minutes)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for range ticker.C {
+		c.onlineMu.RLock()
+		domains := make(map[string]time.Time, len(c.lastFailed))
+		maps.Copy(domains, c.lastFailed)
+		c.onlineMu.RUnlock()
+
+		for domain, lastFailed := range domains {
+			c.onlineMu.Lock()
 			if _, ok := c.failCount[domain]; !ok {
 				c.failCount[domain] = 0
 			}
+			failCount := c.failCount[domain]
+			c.onlineMu.Unlock()
 
-			var span = 0.5 * math.Pow(1.5, float64(min(c.failCount[domain], maxFailCount)))
+			// exponential backoff (max 10 minutes)
+			span := 0.5 * math.Pow(1.5, float64(min(failCount, maxFailCount)))
 			if time.Since(lastFailed) > time.Duration(span)*time.Second {
-				// health check
-				_, err := httpRequest[core.Domain](ctx, c.client, "GET", "https://"+domain+"/api/v1/domain", "", &Options{})
+				err := c.healthCheckDomain(ctx, domain)
 				if err != nil {
-					slog.Info(fmt.Sprintf("Domain %s is offline. Fail count: %d", domain, c.failCount[domain]))
+					slog.Info(fmt.Sprintf("Domain %s is offline. Fail count: %d", domain, failCount))
+					c.onlineMu.Lock()
 					c.lastFailed[domain] = time.Now()
 					c.failCount[domain]++
+					c.onlineMu.Unlock()
 				} else {
 					slog.Info(fmt.Sprintf("Domain %s is back online :3", domain))
+					c.onlineMu.Lock()
 					delete(c.lastFailed, domain)
 					delete(c.failCount, domain)
+					c.onlineMu.Unlock()
 				}
 			}
 		}
 	}
 }
 
-func (c *client) Commit(ctx context.Context, domain, body string, response any, opts *Options) (*http.Response, error) {
-	ctx, span := tracer.Start(ctx, "Client.Commit")
-	defer span.End()
-
-	if !c.IsOnline(domain) {
-		return &http.Response{}, fmt.Errorf("Domain is offline")
-	}
-
-	req, err := http.NewRequest("POST", "https://"+domain+"/api/v1/commit", bytes.NewBuffer([]byte(body)))
+func (c *Client) healthCheckDomain(ctx context.Context, domain string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+domain+"/.well-known/concrnt", nil)
 	if err != nil {
-		span.RecordError(err)
-		return &http.Response{}, err
+		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	if opts != nil {
-		if opts.AuthToken != "" {
-			req.Header.Set("Authorization", "Bearer "+opts.AuthToken)
-		}
-		if opts.Passport != "" {
-			req.Header.Set(core.RequesterPassportHeader, opts.Passport)
-		}
-	}
-
-	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-
 	resp, err := c.client.Do(req)
 	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while committing", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return &http.Response{}, err
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to get well-known concrnt from %s: status code %d", domain, resp.StatusCode)
 	}
 
-	if response != nil && !reflect.ValueOf(response).IsNil() {
-		respbody, _ := io.ReadAll(resp.Body)
-		err = json.Unmarshal(respbody, &response)
-		if err != nil {
-			span.RecordError(err)
-			return &http.Response{}, err
-		}
-	}
-
-	return resp, nil
+	var wkc concrnt.WellKnownConcrnt
+	return json.NewDecoder(resp.Body).Decode(&wkc)
 }
 
-func httpRequest[T any](ctx context.Context, client *http.Client, method, url, body string, opts *Options) (*T, error) {
-	ctx, span := tracer.Start(ctx, "Client.httpRequest")
+func (c *Client) markOffline(domain string) {
+	c.onlineMu.Lock()
+	defer c.onlineMu.Unlock()
+	c.lastFailed[domain] = time.Now()
+}
+
+func (c *Client) markOfflineIfTimeout(domain string, action string, err error) {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		slog.Warn("Mark domain "+domain+" as offline while "+action, "error", err)
+		c.markOffline(domain)
+	}
+}
+
+type Options struct {
+	Resolver string
+	NoCache  bool
+
+	// SkipVerify skips the signed document's proof/signature verification
+	// performed by GetRecord. Only use this for cases where strict
+	// verification is unnecessary, e.g. resolving routing hints, where
+	// the final data is verified separately once actually used.
+	SkipVerify bool
+
+	// AllowedProofTypes restricts which proof types the fetched document may
+	// carry (nil = no restriction). E.g. CIP-13 requires subkey enact
+	// documents to be ecrecover-direct signed, so the auth middleware fetches
+	// them with []string{concrnt.ProofTypeEcrecover}.
+	AllowedProofTypes []string
+}
+
+type QueryParams struct {
+	Prefix string
+	Parent string
+	Schema string
+	Author string
+	Since  *time.Time
+	Until  *time.Time
+	Limit  int
+	Order  string
+}
+
+var ErrEndpointMissing = errors.New("concrnt endpoint missing")
+
+func (c *Client) GetClient() *http.Client {
+	return c.client
+}
+
+func (c *Client) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, span := tracer.Start(req.Context(), "HTTP "+req.Method)
 	defer span.End()
 
-	span.SetAttributes(attribute.String("url", url))
-
-	req, err := http.NewRequest(method, url, bytes.NewBuffer([]byte(body)))
-	if err != nil {
-		return nil, err
+	if remap, ok := c.remappings[req.Host]; ok {
+		req.Host = remap.Host
+		req.URL.Host = remap.Host
+		req.URL.Scheme = remap.Scheme
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	if opts != nil {
-		if opts.AuthToken != "" {
-			req.Header.Set("Authorization", "Bearer "+opts.AuthToken)
-		}
-		if opts.Passport != "" {
-			req.Header.Set(core.RequesterPassportHeader, opts.Passport)
-		}
-	}
+	req.Header.Set("User-Agent", c.userAgent)
+
+	span.SetAttributes(attribute.String("http.method", req.Method))
+	span.SetAttributes(attribute.String("http.url", req.URL.String()))
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	respbody, _ := io.ReadAll(resp.Body)
-	var response core.ResponseBase[T]
-	err = json.Unmarshal(respbody, &response)
-	if err != nil {
-		return nil, err
-	}
-
-	if response.Status != "ok" {
-		if resp.StatusCode == http.StatusNotFound {
-			err = core.NewErrorNotFound()
-		} else if resp.StatusCode == http.StatusForbidden {
-			err = core.NewErrorPermissionDenied()
-		} else {
-			err = fmt.Errorf("Request failed(%s): %v", resp.Status, string(body))
-			slog.InfoContext(ctx, err.Error())
-		}
-		return nil, err
-	}
-
-	return &response.Content, nil
+	return http.DefaultTransport.RoundTrip(req)
 }
 
-func (c *client) resolveResolver(ctx context.Context, resolver string) (string, error) {
+func (c *Client) resolveResolver(ctx context.Context, resolver string) (string, error) {
 	ctx, span := tracer.Start(ctx, "Client.resolveResolver")
 	defer span.End()
+
+	span.SetAttributes(attribute.String("resolver", resolver))
 
 	if resolver == "" {
 		return c.defaultResolver, nil
 	}
 
-	if core.IsCCID(resolver) {
-		entity, err := c.GetEntity(ctx, resolver, &Options{Resolver: c.defaultResolver, Cache: "try-cache"})
+	if concrnt.IsCCID(resolver) {
+		var entity concrnt.Document[schemas.Entity]
+		err := c.GetRecord(
+			ctx,
+			concrnt.ComposeCCURI("cckv", resolver, ""),
+			// This is only used to resolve a routing hint (which domain to
+			// talk to); the record's authenticity isn't load-bearing here,
+			// so strict signature verification is unnecessary.
+			&Options{Resolver: c.defaultResolver, SkipVerify: true},
+			&entity,
+		)
 		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to get entity record for ccid %s", resolver), err)
 			span.RecordError(err)
 			return "", err
 		}
-		return entity.Domain, nil
+		span.SetAttributes(attribute.String("entity_domain", entity.Value.Domain))
+		return entity.Value.Domain, nil
 	}
 
-	if core.IsCSID(resolver) {
-		domain, err := c.LookupCSID(ctx, resolver, &Options{Resolver: c.defaultResolver, Cache: "try-cache"})
+	if concrnt.IsCSID(resolver) {
+		wkc, err := c.GetServer(ctx, resolver, nil)
 		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to get server for csid %s", resolver), err)
 			span.RecordError(err)
 			return "", err
 		}
-		return domain.ID, nil
+		span.SetAttributes(attribute.String("server_domain", wkc.Domain))
+		return wkc.Domain, nil
 	}
 
 	return resolver, nil
 }
 
-func (c *client) GetEntity(ctx context.Context, address string, opts *Options) (core.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetEntity")
+func (c *Client) ResolveResourceHost(ctx context.Context, uri string) (string, error) {
+	ctx, span := tracer.Start(ctx, "Client.ResolveResourceHost")
 	defer span.End()
 
-	resolver := address
-	if opts != nil {
-		if opts.Resolver != "" {
-			resolver = opts.Resolver
+	parsed, err := concrnt.ParseCCURI(uri)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("invalid cc uri %s", uri), err)
+		span.RecordError(err)
+		return "", err
+	}
+
+	return c.resolveResolver(ctx, parsed.Owner)
+}
+
+func (c *Client) GetServer(ctx context.Context, domainOrCSID string, hint *string) (concrnt.WellKnownConcrnt, error) {
+	ctx, span := tracer.Start(ctx, "Client.GetServer")
+	defer span.End()
+
+	cacheKey := "server:" + domainOrCSID
+
+	x, found := c.cache.Get(cacheKey)
+	if found {
+		return x.(concrnt.WellKnownConcrnt), nil
+	}
+
+	if concrnt.IsCSID(domainOrCSID) {
+		var wkc concrnt.WellKnownConcrnt
+		resolver := c.defaultResolver
+		if hint != nil {
+			resolver = *hint
 		}
-		if opts.Cache == "try-cache" {
-			if val, found := c.cache.Get(address); found {
-				return val.(core.Entity), nil
+		err := c.GetResource(
+			ctx,
+			"cckv://"+domainOrCSID,
+			"application/json",
+			&Options{Resolver: resolver},
+			&wkc,
+		)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to get well-known concrnt for csid %s. resolver: %s", domainOrCSID, resolver), err)
+			span.RecordError(err)
+			return concrnt.WellKnownConcrnt{}, err
+		}
+		c.cache.Set(cacheKey, wkc, cache.DefaultExpiration)
+		return wkc, nil
+	} else {
+
+		domain := domainOrCSID
+
+		if !c.IsOnline(domain) {
+			return concrnt.WellKnownConcrnt{}, fmt.Errorf("Domain is offline")
+		}
+
+		url := "https://" + domain + "/.well-known/concrnt"
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to create request for well-known concrnt at %s", url), err)
+			span.RecordError(err)
+			return concrnt.WellKnownConcrnt{}, err
+		}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			c.markOfflineIfTimeout(domain, "getting well-known concrnt", err)
+			err := errors.Join(fmt.Errorf("failed to perform request for well-known concrnt at %s", url), err)
+			span.RecordError(err)
+			return concrnt.WellKnownConcrnt{}, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			err := errors.Join(fmt.Errorf("failed to get well-known concrnt from %s", url), err)
+			span.RecordError(err)
+			c.markOffline(domain)
+			return concrnt.WellKnownConcrnt{}, err
+		}
+		var wkc concrnt.WellKnownConcrnt
+		err = json.NewDecoder(resp.Body).Decode(&wkc)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to decode well-known concrnt from %s", url), err)
+			span.RecordError(err)
+			return concrnt.WellKnownConcrnt{}, err
+		}
+		c.cache.Set(cacheKey, wkc, cache.DefaultExpiration)
+		return wkc, nil
+	}
+}
+
+func (c *Client) ResolveResourceURI(ctx context.Context, uri string, opts *Options) (string, error) {
+	ctx, span := tracer.Start(ctx, "Client.ResolveResourceURI")
+	defer span.End()
+
+	if opts == nil {
+		opts = &Options{}
+	}
+
+	parsed, err := concrnt.ParseCCURI(uri)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("invalid cc uri %s", uri), err)
+		span.RecordError(err)
+		return "", err
+	}
+
+	endpoint := uri
+
+	if parsed.Scheme != "http" {
+		var info concrnt.WellKnownConcrnt
+		if opts.Resolver != "" {
+			info, err = c.GetServer(ctx, opts.Resolver, nil)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to get server for resolver %s", opts.Resolver), err)
+				span.RecordError(err)
+				return "", err
+			}
+		} else {
+			domain, err := c.resolveResolver(ctx, parsed.Owner)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to resolve default resolver for owner %s", parsed.Owner), err)
+				span.RecordError(err)
+				return "", err
+			}
+			info, err = c.GetServer(ctx, domain, nil)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to get server for default resolver %s", domain), err)
+				span.RecordError(err)
+				return "", err
 			}
 		}
-	}
 
-	domain, err := c.resolveResolver(ctx, resolver)
-	if err != nil {
-		span.RecordError(err)
-		return core.Entity{}, err
-	}
-
-	if !c.IsOnline(domain) {
-		return core.Entity{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/entity/" + address
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Entity](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting entity", "error", err)
-			c.lastFailed[domain] = time.Now()
+		desc, ok := info.Endpoints["net.concrnt.core.resolve"]
+		if !ok {
+			err := fmt.Errorf("resource endpoint not found in server %s", info.Domain)
+			span.RecordError(err)
+			return "", err
 		}
 
-		return core.Entity{}, err
+		path, err := concrnt.RenderURITemplate(desc, map[string]string{
+			"owner": parsed.Owner,
+			"key":   parsed.Key,
+			"uri":   url.QueryEscape(uri),
+		})
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to render resource endpoint template for server %s", info.Domain), err)
+			span.RecordError(err)
+			return "", err
+		}
+
+		endpoint = "https://" + info.Domain + path
 	}
 
-	go func() {
-		c.cache.Set(address, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
+	return endpoint, nil
 }
 
-func (c *client) GetMessage(ctx context.Context, id string, opts *Options) (core.Message, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetMessage")
+func (c *Client) GetResource(ctx context.Context, uri string, accept string, opts *Options, result any) error {
+	ctx, span := tracer.Start(ctx, "Client.GetResource")
 	defer span.End()
 
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(id); found {
-			return val.(core.Message), nil
+	if opts == nil {
+		opts = &Options{}
+	}
+
+	// ==== cache check =============
+	cacheKey := "resource:" + uri + ":" + accept
+	if !opts.NoCache {
+		x, found := c.cache.Get(cacheKey)
+		if found {
+			resultBytes := x.([]byte)
+			err := json.Unmarshal(resultBytes, &result)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to unmarshal cached resource for uri %s", uri), err)
+				span.RecordError(err)
+				return err
+			}
+			return nil
 		}
 	}
+	// ==============================
 
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
+	parsed, err := concrnt.ParseCCURI(uri)
 	if err != nil {
+		err := errors.Join(fmt.Errorf("invalid cc uri %s", uri), err)
 		span.RecordError(err)
-		return core.Message{}, err
+		return err
 	}
 
-	if !c.IsOnline(domain) {
-		return core.Message{}, fmt.Errorf("Domain is offline")
+	endpoint := uri
 
-	}
-
-	url := "https://" + domain + "/api/v1/message/" + id
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Message](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting message", "error", err)
-			c.lastFailed[domain] = time.Now()
+	if parsed.Scheme != "http" {
+		var info concrnt.WellKnownConcrnt
+		if opts.Resolver != "" {
+			info, err = c.GetServer(ctx, opts.Resolver, nil)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to get server for resolver %s", opts.Resolver), err)
+				span.RecordError(err)
+				return err
+			}
+		} else {
+			domain, err := c.resolveResolver(ctx, parsed.Owner)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to resolve default resolver for owner %s", parsed.Owner), err)
+				span.RecordError(err)
+				return err
+			}
+			info, err = c.GetServer(ctx, domain, nil)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to get server for default resolver %s", domain), err)
+				span.RecordError(err)
+				return err
+			}
 		}
 
-		return core.Message{}, err
+		desc, ok := info.Endpoints["net.concrnt.core.resolve"]
+		if !ok {
+			err := fmt.Errorf("resource endpoint not found in server %s", info.Domain)
+			span.RecordError(err)
+			return err
+		}
+
+		path, err := concrnt.RenderURITemplate(desc, map[string]string{
+			"owner": parsed.Owner,
+			"key":   parsed.Key,
+			"uri":   url.QueryEscape(uri),
+		})
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to render resource endpoint template for server %s", info.Domain), err)
+			span.RecordError(err)
+			return err
+		}
+
+		endpoint = "https://" + info.Domain + path
 	}
 
-	go func() {
-		c.cache.Set(id, *response, cache.DefaultExpiration)
-	}()
+	endpointURL, err := url.Parse(endpoint)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to parse endpoint for resource %s", uri), err)
+		span.RecordError(err)
+		return err
+	}
+	domain := endpointURL.Hostname()
+	if domain != "" && !c.IsOnline(domain) {
+		return fmt.Errorf("Domain is offline")
+	}
 
-	return *response, nil
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to create request for resource %s", uri), err)
+		span.RecordError(err)
+		return err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.markOfflineIfTimeout(domain, "getting resource", err)
+		err := errors.Join(fmt.Errorf("failed to perform request for resource %s", uri), err)
+		span.RecordError(err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("failed to get resource %s: status code %d", uri, resp.StatusCode)
+		span.RecordError(err)
+		return err
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to decode resource %s", uri), err)
+		span.RecordError(err)
+		return err
+	}
+
+	if !opts.NoCache {
+		bytes, err := json.Marshal(result)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to marshal resource for caching for uri %s", uri), err)
+			span.RecordError(err)
+			return err
+		}
+		c.cache.Set(cacheKey, bytes, cache.DefaultExpiration)
+	}
+
+	return nil
 }
 
-func (c *client) GetAssociation(ctx context.Context, id string, opts *Options) (core.Association, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetAssociation")
+func (c *Client) GetRecord(ctx context.Context, uri string, opts *Options, result any) error {
+	ctx, span := tracer.Start(ctx, "Client.GetRecord")
 	defer span.End()
 
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(id); found {
-			return val.(core.Association), nil
+	var sd concrnt.SignedDocument
+	err := c.GetResource(ctx, uri, "application/json", opts, &sd)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to get signed document for resource %s", uri), err)
+		span.RecordError(err)
+		return err
+	}
+
+	if opts == nil || !opts.SkipVerify {
+		// The top-level proof-type restriction is a plain field check on the
+		// document we already hold, so it is enforced here directly — the
+		// verification cache below then only ever records unrestricted
+		// verifications and stays valid for restricted and unrestricted
+		// callers alike.
+		if opts != nil && opts.AllowedProofTypes != nil && !slices.Contains(opts.AllowedProofTypes, sd.Proof.Type) {
+			err := fmt.Errorf("proof type %s is not allowed for resource %s (allowed: %s)", sd.Proof.Type, uri, strings.Join(opts.AllowedProofTypes, ", "))
+			span.RecordError(err)
+			return err
 		}
-	}
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return core.Association{}, err
-	}
-
-	if !c.IsOnline(domain) {
-		return core.Association{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/association/" + id
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Association](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting association", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return core.Association{}, err
-	}
-
-	go func() {
-		c.cache.Set(id, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) GetProfile(ctx context.Context, id string, opts *Options) (core.Profile, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetProfile")
-	defer span.End()
-
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(id); found {
-			return val.(core.Profile), nil
-		}
-	}
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return core.Profile{}, err
-	}
-
-	if !c.IsOnline(domain) {
-		return core.Profile{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/profile/" + id
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Profile](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting profile", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return core.Profile{}, err
-	}
-
-	go func() {
-		c.cache.Set(id, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) GetTimeline(ctx context.Context, id string, opts *Options) (core.Timeline, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetTimeline")
-	defer span.End()
-
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(id); found {
-			return val.(core.Timeline), nil
-		}
-	}
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return core.Timeline{}, err
-	}
-
-	if !c.IsOnline(domain) {
-		return core.Timeline{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/timeline/" + id
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Timeline](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting timeline", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return core.Timeline{}, err
-	}
-
-	go func() {
-		c.cache.Set(id, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) GetChunks(ctx context.Context, timelines []string, queryTime time.Time, opts *Options) (map[string]core.Chunk, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetChunks")
-	defer span.End()
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !c.IsOnline(domain) {
-		return nil, fmt.Errorf("Domain is offline")
-	}
-
-	timelinesStr := strings.Join(timelines, ",")
-	timeStr := fmt.Sprintf("%d", queryTime.Unix())
-
-	url := "https://" + domain + "/api/v1/timelines/chunks?timelines=" + timelinesStr + "&time=" + timeStr
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[map[string]core.Chunk](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting chunks", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return nil, err
-	}
-
-	return *response, nil
-}
-
-func (c *client) GetChunkItrs(ctx context.Context, timelines []string, epoch string, opts *Options) (map[string]string, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetChunkItrs")
-	defer span.End()
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !c.IsOnline(domain) {
-		return nil, fmt.Errorf("Domain is offline")
-	}
-
-	timelinesStr := strings.Join(timelines, ",")
-
-	url := "https://" + domain + "/api/v1/chunks/itr?timelines=" + timelinesStr + "&epoch=" + epoch
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[map[string]string](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting chunk itrs", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return nil, err
-	}
-
-	return *response, nil
-}
-
-func (c *client) GetChunkBodies(ctx context.Context, query map[string]string, opts *Options) (map[string]core.Chunk, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetChunkBodies")
-	defer span.End()
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !c.IsOnline(domain) {
-		return nil, fmt.Errorf("Domain is offline")
-	}
-
-	queries := []string{}
-	for key, value := range query {
-		queries = append(queries, key+":"+value)
-	}
-
-	url := "https://" + domain + "/api/v1/chunks/body?query=" + strings.Join(queries, ",")
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[map[string]core.Chunk](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting chunk bodies", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return nil, err
-	}
-
-	return *response, nil
-}
-
-func (c *client) GetKey(ctx context.Context, id string, opts *Options) ([]core.Key, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetKey")
-	defer span.End()
-
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(id); found {
-			return val.([]core.Key), nil
-		}
-	}
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !c.IsOnline(domain) {
-		return nil, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/key/" + id
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[[]core.Key](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting key", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return nil, err
-	}
-
-	go func() {
-		c.cache.Set(id, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) LookupCSID(ctx context.Context, csid string, opts *Options) (core.Domain, error) {
-	ctx, span := tracer.Start(ctx, "Client.LookupCSID")
-	defer span.End()
-
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(csid); found {
-			return val.(core.Domain), nil
-		}
-	}
-
-	url := "https://" + c.defaultResolver + "/api/v1/domain/" + csid
-	span.SetAttributes(attribute.String("url", url))
-	response, err := httpRequest[core.Domain](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-		return core.Domain{}, err
-	}
-
-	go func() {
-		c.cache.Set(csid, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) GetDomain(ctx context.Context, domain string, opts *Options) (core.Domain, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetDomain")
-	defer span.End()
-
-	if opts != nil && opts.Cache == "try-cache" {
-		if val, found := c.cache.Get(domain); found {
-			return val.(core.Domain), nil
-		}
-	}
-
-	if core.IsCSID(domain) {
-		d, err := c.LookupCSID(ctx, domain, &Options{Cache: "try-cache"})
+		// GetResource caches the raw (unverified) signed document, so cache
+		// hits would re-pay signature verification on every call — remember
+		// successful verifications separately, keyed by content hash so a
+		// re-fetched document can never ride an older entry's verification.
+		// Hot path: the auth middleware verifies the subkey document once
+		// per authenticated request.
+		verifiedKey := "verified:" + uri
+		proofBytes, err := json.Marshal(sd.Proof)
 		if err != nil {
 			span.RecordError(err)
-			return core.Domain{}, err
+			return err
 		}
-		domain = d.ID
-	}
-
-	if !c.IsOnline(domain) {
-		return core.Domain{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/domain"
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Domain](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting domain", "error", err)
-			c.lastFailed[domain] = time.Now()
+		docHash := string(concrnt.GetHash(append([]byte(sd.Document), proofBytes...)))
+		useCache := opts == nil || !opts.NoCache
+		verified := false
+		if useCache {
+			if x, found := c.cache.Get(verifiedKey); found {
+				hash, ok := x.(string)
+				verified = ok && hash == docHash
+			}
 		}
-
-		return core.Domain{}, err
-	}
-
-	go func() {
-		c.cache.Set(domain, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
-}
-
-func (c *client) GetRetracted(ctx context.Context, timelines []string, opts *Options) (map[string][]string, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetRetracted")
-	defer span.End()
-
-	domain, err := c.resolveResolver(ctx, opts.Resolver)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !c.IsOnline(domain) {
-		return nil, fmt.Errorf("Domain is offline")
-	}
-
-	timelinesStr := strings.Join(timelines, ",")
-	url := "https://" + domain + "/api/v1/timelines/retracted?timelines=" + timelinesStr
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[map[string][]string](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting retracted", "error", err)
-			c.lastFailed[domain] = time.Now()
-		}
-
-		return nil, err
-	}
-
-	return *response, nil
-}
-
-func (c *client) GetAck(ctx context.Context, from, to string, opts *Options) (core.Ack, error) {
-	ctx, span := tracer.Start(ctx, "Client.GetAck")
-	defer span.End()
-
-	cacheKey := "ack:" + from + ":" + to
-	resolver := from
-	if opts != nil {
-		if opts.Resolver != "" {
-			resolver = opts.Resolver
-		}
-		if opts.Cache == "try-cache" {
-			if val, found := c.cache.Get(cacheKey); found {
-				return val.(core.Ack), nil
+		if !verified {
+			err := sd.Verify(ctx, &optionsResolver{c: c, opts: opts})
+			if err != nil {
+				err := errors.Join(fmt.Errorf("signature verification failed for resource %s", uri), err)
+				span.RecordError(err)
+				return err
+			}
+			if useCache {
+				c.cache.Set(verifiedKey, docHash, cache.DefaultExpiration)
 			}
 		}
 	}
 
-	domain, err := c.resolveResolver(ctx, resolver)
+	err = json.Unmarshal([]byte(sd.Document), &result)
 	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to decode document in signed document for resource %s", uri), err)
 		span.RecordError(err)
-		return core.Ack{}, err
+		return err
 	}
 
-	if !c.IsOnline(from) {
-		return core.Ack{}, fmt.Errorf("Domain is offline")
-	}
-
-	url := "https://" + domain + "/api/v1/ack/" + from + "/" + to
-	span.SetAttributes(attribute.String("url", url))
-
-	response, err := httpRequest[core.Ack](ctx, c.client, "GET", url, "", opts)
-	if err != nil {
-		span.RecordError(err)
-
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			slog.Warn("Mark domain "+domain+" as offline while getting ack", "error", err)
-			c.lastFailed[from] = time.Now()
-		}
-
-		return core.Ack{}, err
-	}
-
-	go func() {
-		c.cache.Set(cacheKey, *response, cache.DefaultExpiration)
-	}()
-
-	return *response, nil
+	return nil
 }
 
-func (c *client) ConnectWebsocket(ctx context.Context, domain string, path string) (*websocket.Conn, error) {
-	_, span := tracer.Start(ctx, "Client.ConnectWebsocket")
+// InvalidateResource drops any cached copy (and remembered verification) of
+// the resource at uri, so the next fetch observes the latest version.
+func (c *Client) InvalidateResource(uri string) {
+	c.cache.Delete("resource:" + uri + ":application/json")
+	c.cache.Delete("verified:" + uri)
+}
+
+// ResolveSignedDocument fetches the signed document at uri, satisfying
+// concrnt.DocumentResolver so a *Client can be passed directly to
+// SignedDocument.Verify.
+func (c *Client) ResolveSignedDocument(ctx context.Context, uri string) (concrnt.SignedDocument, error) {
+	return (&optionsResolver{c: c}).ResolveSignedDocument(ctx, uri)
+}
+
+// optionsResolver adapts a *Client plus per-call Options (e.g. a routing
+// Resolver hint) to concrnt.DocumentResolver, for verification paths that
+// need to honor the caller's Options while fetching referenced documents.
+type optionsResolver struct {
+	c    *Client
+	opts *Options
+}
+
+func (r *optionsResolver) ResolveSignedDocument(ctx context.Context, uri string) (concrnt.SignedDocument, error) {
+	var sd concrnt.SignedDocument
+	err := r.c.GetResource(ctx, uri, "application/json", r.opts, &sd)
+	if err != nil {
+		return concrnt.SignedDocument{}, err
+	}
+	return sd, nil
+}
+
+func (c *Client) Query(ctx context.Context, resolver string, params QueryParams) (concrnt.QueryResult, error) {
+	ctx, span := tracer.Start(ctx, "Client.Query")
 	defer span.End()
+
+	if params.Prefix != "" && params.Parent != "" {
+		err := errors.New("prefix and parent cannot be specified at the same time")
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	if params.Order != "" && params.Order != "asc" && params.Order != "desc" {
+		err := fmt.Errorf("invalid order parameter: %s", params.Order)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	domain, err := c.resolveResolver(ctx, resolver)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to resolve resolver %s", resolver), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+	if domain == "" {
+		err := errors.New("resolver cannot be empty")
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	server, err := c.GetServer(ctx, domain, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to get server for resolver %s", domain), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	desc, ok := server.Endpoints["net.concrnt.core.query"]
+	if !ok {
+		err := errors.Join(fmt.Errorf("query endpoint not found in server %s", server.Domain), ErrEndpointMissing)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	args := map[string]string{}
+	if params.Prefix != "" {
+		args["prefix"] = params.Prefix
+	}
+	if params.Parent != "" {
+		args["parent"] = params.Parent
+	}
+	if params.Schema != "" {
+		args["schema"] = params.Schema
+	}
+	if params.Author != "" {
+		args["author"] = params.Author
+	}
+	if params.Since != nil {
+		args["since"] = params.Since.UTC().Format(time.RFC3339Nano)
+	}
+	if params.Until != nil {
+		args["until"] = params.Until.UTC().Format(time.RFC3339Nano)
+	}
+	if params.Limit > 0 {
+		args["limit"] = fmt.Sprint(params.Limit)
+	}
+	if params.Order != "" {
+		args["order"] = params.Order
+	}
+
+	path, err := concrnt.RenderURITemplate(desc, args)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to render query endpoint template for server %s", server.Domain), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+	if !c.IsOnline(server.Domain) {
+		return concrnt.QueryResult{}, fmt.Errorf("Domain is offline")
+	}
+	url := "https://" + server.Domain + path
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to create request for query to %s", url), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.markOfflineIfTimeout(server.Domain, "querying", err)
+		err := errors.Join(fmt.Errorf("failed to perform query to %s", url), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("failed to query %s: status code %d", url, resp.StatusCode)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	var result concrnt.QueryResult
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to decode query response from %s", url), err)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
+	return result, nil
+}
+
+// Call invokes a named concrnt API (an entry in the target server's
+// /.well-known/concrnt Endpoints map, e.g. "net.concrnt.core.acknowledges")
+// and decodes the JSON response into result.
+func (c *Client) Call(ctx context.Context, resolver string, endpoint string, params map[string]string, opts *Options, result any) error {
+	ctx, span := tracer.Start(ctx, "Client.Call")
+	defer span.End()
+
+	if opts == nil {
+		opts = &Options{}
+	}
+
+	domain, err := c.resolveResolver(ctx, resolver)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to resolve resolver %s", resolver), err)
+		span.RecordError(err)
+		return err
+	}
+	if domain == "" {
+		err := errors.New("resolver cannot be empty")
+		span.RecordError(err)
+		return err
+	}
+
+	server, err := c.GetServer(ctx, domain, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to get server for resolver %s", domain), err)
+		span.RecordError(err)
+		return err
+	}
+
+	desc, ok := server.Endpoints[endpoint]
+	if !ok {
+		err := errors.Join(fmt.Errorf("endpoint %s not found in server %s", endpoint, server.Domain), ErrEndpointMissing)
+		span.RecordError(err)
+		return err
+	}
+
+	path, err := concrnt.RenderURITemplate(desc, params)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to render endpoint template %s for server %s", endpoint, server.Domain), err)
+		span.RecordError(err)
+		return err
+	}
+	url := "https://" + server.Domain + path
+
+	// ==== cache check =============
+	cacheKey := "call:" + url
+	if !opts.NoCache {
+		x, found := c.cache.Get(cacheKey)
+		if found {
+			resultBytes := x.([]byte)
+			err := json.Unmarshal(resultBytes, &result)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to unmarshal cached call response for %s", url), err)
+				span.RecordError(err)
+				return err
+			}
+			return nil
+		}
+	}
+	// ==============================
+
+	if !c.IsOnline(server.Domain) {
+		return fmt.Errorf("Domain is offline")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to create request for call to %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.markOfflineIfTimeout(server.Domain, "calling "+endpoint, err)
+		err := errors.Join(fmt.Errorf("failed to perform call to %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("failed to call %s: status code %d", url, resp.StatusCode)
+		span.RecordError(err)
+		return err
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to decode call response from %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+
+	if !opts.NoCache {
+		bytes, err := json.Marshal(result)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to marshal call response for caching for %s", url), err)
+			span.RecordError(err)
+			return err
+		}
+		c.cache.Set(cacheKey, bytes, cache.DefaultExpiration)
+	}
+
+	return nil
+}
+
+func (c *Client) Commit(ctx context.Context, resolver string, sd concrnt.SignedDocument) error {
+	ctx, span := tracer.Start(ctx, "Client.Commit")
+	defer span.End()
+
+	if resolver == "" || resolver == c.defaultResolver {
+		resolver = c.defaultResolver
+	} else {
+		domain, err := c.resolveResolver(ctx, resolver)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to resolve resolver %s", resolver), err)
+			span.RecordError(err)
+			return err
+		}
+		resolver = domain
+	}
+
+	if resolver == "" {
+		err := fmt.Errorf("resolver cannot be empty")
+		span.RecordError(err)
+		return err
+	}
+
+	server, err := c.GetServer(ctx, resolver, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to get server for resolver %s", resolver), err)
+		span.RecordError(err)
+		return err
+	}
+
+	desc, ok := server.Endpoints["net.concrnt.core.commit"]
+	if !ok {
+		err := fmt.Errorf("commit endpoint not found in server %s", server.Domain)
+		span.RecordError(err)
+		return err
+	}
+
+	path, err := concrnt.RenderURITemplate(desc, map[string]string{})
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to render commit endpoint template for server %s", server.Domain), err)
+		span.RecordError(err)
+		return err
+	}
+	if !c.IsOnline(server.Domain) {
+		return fmt.Errorf("Domain is offline")
+	}
+	url := "https://" + server.Domain + path
+
+	body, err := json.Marshal(sd)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to marshal signed document for commit to %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, io.NopCloser(bytes.NewReader(body)))
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to create request for commit to %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.markOfflineIfTimeout(server.Domain, "committing", err)
+		err := errors.Join(fmt.Errorf("failed to perform request for commit to %s", url), err)
+		span.RecordError(err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("failed to commit to %s: status code %d", url, resp.StatusCode)
+		span.RecordError(err)
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) Realtime(ctx context.Context, fqdn string) (*websocket.Conn, error) {
+	_, span := tracer.Start(ctx, "Client.Realtime")
+	defer span.End()
+
+	server, err := c.GetServer(ctx, fqdn, nil)
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to get server for realtime connection to %s", fqdn), err)
+		span.RecordError(err)
+		return nil, err
+	}
+
+	desc, ok := server.Endpoints["net.concrnt.core.realtime"]
+	if !ok {
+		err := fmt.Errorf("realtime endpoint not found in server %s", server.Domain)
+		span.RecordError(err)
+		return nil, err
+	}
+
+	path, err := concrnt.RenderURITemplate(desc, map[string]string{})
+	if err != nil {
+		err := errors.Join(fmt.Errorf("failed to render realtime endpoint template for server %s", server.Domain), err)
+		span.RecordError(err)
+		return nil, err
+	}
+	domain := server.Domain
 
 	if !c.IsOnline(domain) {
 		return nil, fmt.Errorf("Domain is offline")
 	}
 
 	u := url.URL{Scheme: "wss", Host: domain, Path: path}
-	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
+	dialer := &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 10 * time.Second,
+	}
 
 	header := http.Header{}
 	header.Set("User-Agent", c.userAgent)
 
-	conn, _, err := dialer.Dial(u.String(), header)
+	conn, _, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
 		slog.Warn("Failed to connect to websocket. Mark domain "+domain+" as offline", "error", err)
-		c.lastFailed[domain] = time.Now()
+		c.markOffline(domain)
 		span.RecordError(err)
 		return nil, err
 	}
 
 	return conn, nil
+}
+
+// requests: map[requestID]map[key]url
+// -> map[key]http.Response
+func (c *Client) BatchGet(ctx context.Context, requests map[string]map[string]string) (map[string]*http.Response, error) {
+	ctx, span := tracer.Start(ctx, "Client.BatchGet")
+	defer span.End()
+
+	var responses = make(map[string]*http.Response)
+
+	for domain, reqs := range requests {
+		if !c.IsOnline(domain) {
+			return nil, fmt.Errorf("Domain %s is offline", domain)
+		}
+
+		info, err := c.GetServer(ctx, domain, nil)
+		if err != nil {
+			err := errors.Join(fmt.Errorf("failed to get server for domain %s", domain), err)
+			span.RecordError(err)
+			continue
+		}
+
+		desc, ok := info.Endpoints["net.concrnt.core.batch"]
+		if ok {
+			path, err := concrnt.RenderURITemplate(desc, map[string]string{})
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to render batch endpoint template for server %s", info.Domain), err)
+				span.RecordError(err)
+				continue
+			}
+			endpoint := "https://" + info.Domain + path
+
+			requests := make(map[string]*http.Request)
+			for key, url := range reqs {
+				req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+				if err != nil {
+					err := errors.Join(fmt.Errorf("failed to create request for batch get to %s", url), err)
+					span.RecordError(err)
+					continue
+				}
+				requests[key] = req
+			}
+
+			responces, err := DoBatchRequestWithClient(ctx, c.client, endpoint, requests)
+			if err != nil {
+				err := errors.Join(fmt.Errorf("failed to perform batch get to %s", endpoint), err)
+				span.RecordError(err)
+				continue
+			}
+
+			maps.Copy(responses, responces)
+
+		} else {
+			keys := make([]string, 0, len(reqs))
+			for key := range reqs {
+				keys = append(keys, key)
+			}
+
+			var mu sync.Mutex
+			runBounded(batchFallbackConcurrency, len(keys), func(i int) {
+				key := keys[i]
+				url := reqs[key]
+
+				req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+				if err != nil {
+					err := errors.Join(fmt.Errorf("failed to create request for get to %s", url), err)
+					span.RecordError(err)
+					return
+				}
+				resp, err := c.client.Do(req)
+				if err != nil {
+					c.markOfflineIfTimeout(domain, "batch get", err)
+					err := errors.Join(fmt.Errorf("failed to perform get to %s", url), err)
+					span.RecordError(err)
+					return
+				}
+				mu.Lock()
+				responses[key] = resp
+				mu.Unlock()
+			})
+		}
+	}
+
+	return responses, nil
 }

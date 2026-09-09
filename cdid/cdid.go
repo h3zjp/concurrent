@@ -1,52 +1,70 @@
 package cdid
 
 import (
-	"crypto/rand"
 	"encoding/base32"
+	"golang.org/x/crypto/sha3"
 	"time"
 )
 
 var (
-	encoding = "0123456789abcdefghjkmnpqrstvwxyz"
+	encoding = "0123456789abcdefghjkmnpqrstuvwyz"
 	encoder  = base32.NewEncoding(encoding).WithPadding(base32.NoPadding)
 	decoder  = base32.NewEncoding(encoding).WithPadding(base32.NoPadding)
 )
 
+type Kind int
+
+const (
+	KindTime Kind = iota
+	KindHash
+)
+
 type CDID struct {
-	data [10]byte
+	kind Kind
 	time [6]byte
+	data [10]byte
+
+	hash [15]byte
 }
 
 func New(data [10]byte, t time.Time) CDID {
-	c := CDID{data: data}
-	c.SetTime(t)
+	c := CDID{
+		kind: KindTime,
+		data: data,
+	}
+	c.setTime(t)
 	return c
 }
 
-func NewFromBytes(b []byte) CDID {
-	data := [10]byte{}
-	copy(data[:], b[:10])
-	return NewWithAutoTime(data)
-}
-
-func NewWithAutoTime(data [10]byte) CDID {
-	c := CDID{data: data}
-	c.SetTime(time.Now())
+func NewFromHash(data [15]byte) CDID {
+	c := CDID{
+		kind: KindHash,
+		hash: data,
+	}
 	return c
 }
 
-func Make() CDID {
-	var data [10]byte
-	rand.Read(data[:])
-	return NewWithAutoTime(data)
+func MakeHash(b []byte) CDID {
+	hash := sha3.NewLegacyKeccak256()
+	hash.Write(b)
+	hashBytes := hash.Sum(nil)
+
+	var data [15]byte
+	copy(data[:], hashBytes[:15])
+	return NewFromHash(data)
 }
 
-func (c *CDID) SetData(data [10]byte) {
-	c.data = data
-}
+func (c *CDID) setTime(t time.Time) {
 
-func (c *CDID) SetTime(t time.Time) {
-	m := uint64(t.Unix())*1e3 + uint64(t.Nanosecond()/int(time.Millisecond))
+	if c.kind == KindHash {
+		return
+	}
+
+	// Clamp to the 48-bit unix-millisecond range: string order on encoded
+	// CDIDs must follow time order, and out-of-range values (most notably the
+	// negative unix time of an unset zero time.Time) would otherwise wrap
+	// around into the far future.
+	m := min(max(t.UnixMilli(), 0), 1<<48-1)
 
 	c.time[0] = byte(m >> 40)
 	c.time[1] = byte(m >> 32)
@@ -57,6 +75,11 @@ func (c *CDID) SetTime(t time.Time) {
 }
 
 func (c CDID) GetTime() time.Time {
+
+	if c.kind == KindHash {
+		return time.Time{}
+	}
+
 	m := int64(c.time[0])<<40 |
 		int64(c.time[1])<<32 |
 		int64(c.time[2])<<24 |
@@ -70,51 +93,63 @@ func (c CDID) GetTime() time.Time {
 }
 
 func (c *CDID) Bytes() []byte {
-	return append(c.data[:], c.time[:]...)
+	if c.kind == KindHash {
+		return c.hash[:]
+	} else {
+		return append(c.time[:], c.data[:]...)
+	}
 }
 
 func (c CDID) String() string {
-	return encoder.EncodeToString(c.Bytes())
+	if c.kind == KindHash {
+		return "x" + encoder.EncodeToString(c.hash[:])
+	} else {
+		return encoder.EncodeToString(c.Bytes())
+	}
 }
 
 func Parse(s string) (CDID, error) {
-	b, err := decoder.DecodeString(s)
-	if err != nil {
-		return CDID{}, err
-	}
 
-	if len(b) != 16 {
-		return CDID{}, nil
-	}
+	if s[0] == 'x' { // hash-based CDID
+		b, err := decoder.DecodeString(s[1:])
+		if err != nil {
+			return CDID{}, err
+		}
 
-	var c CDID
-	copy(c.data[:], b[:10])
-	copy(c.time[:], b[10:])
-	return c, nil
+		if len(b) != 15 {
+			return CDID{}, nil
+		}
+
+		var c CDID
+		c.kind = KindHash
+		copy(c.hash[:], b)
+		return c, nil
+	} else { // time-based CDID
+		b, err := decoder.DecodeString(s)
+		if err != nil {
+			return CDID{}, err
+		}
+
+		if len(b) != 16 {
+			return CDID{}, nil
+		}
+
+		var c CDID
+		copy(c.time[:], b[:6])
+		copy(c.data[:], b[6:])
+		return c, nil
+	}
+}
+
+func IsHashCDID(s string) bool {
+	return len(s) > 0 && s[0] == 'x'
+}
+
+func IsTimeCDID(s string) bool {
+	return len(s) > 0 && s[0] != 'x'
 }
 
 func IsCDIDChar(c byte) bool {
-	// 0-9 a-z but no i, l, o, u
-	return ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) && c != 'i' && c != 'l' && c != 'o' && c != 'u'
-}
-
-func IsSeemsCDID(str string, expectPrefix byte) bool {
-	if len(str) == 27 {
-		if str[0] != expectPrefix {
-			return false
-		}
-		str = str[1:]
-	}
-
-	if len(str) != 26 {
-		return false
-	}
-
-	for i := 0; i < 26; i++ {
-		if !IsCDIDChar(str[i]) {
-			return false
-		}
-	}
-
-	return true
+	// 0-9 a-z but no i, l, o, x ('x' is reserved as the hash-CDID prefix)
+	return ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')) && c != 'i' && c != 'l' && c != 'o' && c != 'x'
 }

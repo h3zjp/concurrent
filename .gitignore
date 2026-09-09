@@ -1,13 +1,7 @@
-concurrent
+/concrnt
+tmp
 _composeData
 _etc
-
-*.exe
-*.log
-.idea/
-/cmd/test
-
-cmd/api/api
-cmd/gateway/gateway
-
+.codex
+references
 ecosystem.config.js

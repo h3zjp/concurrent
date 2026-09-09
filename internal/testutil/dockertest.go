@@ -21,7 +21,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	"github.com/concrnt/concrnt/core"
+	"github.com/concrnt/concrnt/internal/infra/database"
 )
 
 var (
@@ -149,24 +149,7 @@ func CreateDB() (*gorm.DB, func()) {
 		log.Fatalf("Could not connect to docker: %s", err)
 	}
 
-	db.AutoMigrate(
-		&core.Schema{},
-		&core.Message{},
-		&core.Profile{},
-		&core.Association{},
-		&core.Timeline{},
-		&core.TimelineItem{},
-		&core.Domain{},
-		&core.Entity{},
-		&core.EntityMeta{},
-		&core.Ack{},
-		&core.Key{},
-		&core.UserKV{},
-		&core.Subscription{},
-		&core.SubscriptionItem{},
-		&core.SemanticID{},
-		&core.Job{}, // Add Job struct
-	)
+	database.MigratePostgres(db)
 
 	return db, cleanup
 }

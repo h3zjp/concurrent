@@ -1,0 +1,1038 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bradfitz/gomemcache/memcache"
+
+	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/chunkline"
+	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/internal/worker"
+	"github.com/concrnt/concrnt/schemas"
+)
+
+const (
+	manifestCacheTTL = 60 * 60 * 24 * 7 // 7 days
+	itrCacheTTL      = 60 * 60 * 24 * 2 // 2 days
+	bodyCacheTTL     = 60 * 60 * 24 * 2 // 2 days
+	removedCacheTTL  = 60 * 60 * 24 * 2 // 2 days, matches the origin's advertisement window
+	removedFreshTTL  = 60               // throttles origin refresh to ~1/min/timeline
+)
+
+// purgeReplayDelay must exceed the workers' aggregate-subscription cache TTL
+// (worker.WorkerSubscriber, 3s): a worker holding a pre-close aggregate can
+// re-cache a just-purged latest chunk for up to that long, so close-edge
+// purges run a second time after this delay to sweep such resurrections.
+// Package variable so tests can shorten it.
+var purgeReplayDelay = 8 * time.Second
+
+// SubscriptionDemand reports the realtime subscription demand of this replica,
+// used to decide whether a latest chunk will be kept fresh by the cache
+// updater and is therefore safe to cache.
+type SubscriptionDemand interface {
+	CurrentSubscriptions() []string
+}
+
+type ChunklineGateway struct {
+	resolver *chunkline.Client
+	r        *resolver
+}
+
+func NewChunklineGateway(
+	cl *client.Client,
+	mc *memcache.Client,
+	demand SubscriptionDemand,
+	pubsub worker.PubSub,
+) *ChunklineGateway {
+	r := &resolver{
+		client: cl,
+		mc:     mc,
+		demand: demand,
+		pubsub: pubsub,
+	}
+	return &ChunklineGateway{
+		resolver: chunkline.NewClient(r),
+		r:        r,
+	}
+}
+
+// StartWorker registers the resolver's cache keep-alive demand on the
+// subscriber, hooks cache purging into the subscription open/close edges, and
+// starts the cache updater. Run this only on the replica that runs the
+// singleton workers (the leader) — the cache updater maintains the shared
+// memcached.
+func (g *ChunklineGateway) StartWorker(ctx context.Context, subscriber *worker.LeaderSubscriber) {
+	g.r.open = subscriber
+	// keep-alive, not a session client: the resolver's demand exists to keep
+	// established caches maintained, and must not feed the served aggregate
+	// that gates cache writes (that feedback would keep every once-read
+	// timeline subscribed forever)
+	subscriber.RegisterKeepAliveClient(g.r)
+	subscriber.SetCachePurger(g.r)
+	go g.r.cacheUpdater(ctx)
+}
+
+func (g *ChunklineGateway) QueryDescending(ctx context.Context, uris []string, until time.Time, limit int) ([]chunkline.BodyItemWithSource, error) {
+	return g.resolver.QueryDescending(ctx, uris, until, limit)
+}
+
+// OpenSubscriptions reports the prefixes whose upstream subscription is
+// currently established (as opposed to merely demanded).
+type OpenSubscriptions interface {
+	OpenPrefixes() []string
+}
+
+// resolver implements chunkline resolver callbacks.
+type resolver struct {
+	client *client.Client
+	mc     *memcache.Client
+	demand SubscriptionDemand
+	pubsub worker.PubSub
+	open   OpenSubscriptions // set by StartWorker on the leader; nil elsewhere
+}
+
+func manifestCacheKey(timeline string) string {
+	return "chunkline_manifest:" + timeline
+}
+
+func itrCacheKey(timeline string, chunkID int64) string {
+	return fmt.Sprintf("chunkline_itr:%s:%d", timeline, chunkID)
+}
+
+func bodyCacheKey(timeline string, chunkID string) string {
+	return fmt.Sprintf("chunkline_body:%s:%s", timeline, chunkID)
+}
+
+func removedCacheKey(timeline string) string {
+	return "chunkline_removed:" + timeline
+}
+
+func removedFreshKey(timeline string) string {
+	return "chunkline_removed_fresh:" + timeline
+}
+
+func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkline.Manifest, error) {
+	ctx, span := tracer.Start(ctx, "ChunklineResolver.resolveTimeline")
+	defer span.End()
+
+	cacheKey := manifestCacheKey(timeline)
+	item, err := r.mc.Get(cacheKey)
+	if err == nil {
+		var manifest chunkline.Manifest
+		err := json.Unmarshal(item.Value, &manifest)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to unmarshal cached manifest for %s: %w", timeline, err))
+		} else if manifest.ChunkSize > 0 {
+			// ChunkSize <= 0 means an invalid manifest cached before this
+			// validation existed — treat it as a miss so it can't reach a
+			// Time2Chunk division (the 7-day TTL is too long to wait out)
+			return manifest, nil
+		}
+	} else if !errors.Is(err, memcache.ErrCacheMiss) {
+		span.RecordError(fmt.Errorf("failed to get manifest from cache for %s: %w", timeline, err))
+	}
+
+	var manifest chunkline.Manifest
+	err = r.client.GetResource(ctx, timeline, "application/chunkline+json", nil, &manifest)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to fetch chunkline manifest for %s: %w", timeline, err))
+		return chunkline.Manifest{}, err
+	}
+
+	// GetResource decodes whatever the resolve endpoint returns: a resource
+	// that is not a chunkline timeline (e.g. a space root resolving to the
+	// entity document) or a broken origin decodes into a zero manifest.
+	// ChunkSize is the Time2Chunk divisor, so letting one through (or caching
+	// it) would panic the process on the next chunk computation.
+	if manifest.ChunkSize <= 0 {
+		err := fmt.Errorf("resource %s is not a chunkline timeline", timeline)
+		span.RecordError(err)
+		return chunkline.Manifest{}, err
+	}
+
+	bytes, err := json.Marshal(manifest)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to marshal manifest for caching for %s: %w", timeline, err))
+	} else {
+		cacheItem := &memcache.Item{
+			Key:        cacheKey,
+			Value:      bytes,
+			Expiration: manifestCacheTTL,
+		}
+		err = r.mc.Set(cacheItem)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to set manifest in cache for %s: %w", timeline, err))
+		}
+	}
+
+	return manifest, nil
+}
+
+func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (map[string]chunkline.Manifest, error) {
+	ctx, span := tracer.Start(ctx, "ChunklineResolver.ResolveTimelines")
+	defer span.End()
+
+	keys := make([]string, len(timelines))
+	for i, tl := range timelines {
+		keys[i] = manifestCacheKey(tl)
+	}
+
+	cacheItems, err := r.mc.GetMulti(keys)
+	if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+		span.RecordError(fmt.Errorf("failed to get manifests from cache: %w", err))
+	}
+
+	result := make(map[string]chunkline.Manifest)
+	remaining := []string{}
+
+	for i, tl := range timelines {
+		cacheKey := keys[i]
+		if item, found := cacheItems[cacheKey]; found {
+			var manifest chunkline.Manifest
+			err := json.Unmarshal(item.Value, &manifest)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to unmarshal cached manifest for %s: %w", tl, err))
+				remaining = append(remaining, tl)
+				continue
+			}
+			// invalid manifest cached before validation existed: treat as a
+			// miss (see resolveTimeline)
+			if manifest.ChunkSize <= 0 {
+				remaining = append(remaining, tl)
+				continue
+			}
+			result[tl] = manifest
+		} else {
+			remaining = append(remaining, tl)
+		}
+	}
+
+	for _, tl := range remaining {
+		var manifest chunkline.Manifest
+		err := r.client.GetResource(ctx, tl, "application/chunkline+json", nil, &manifest)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to fetch chunkline manifest for %s: %w", tl, err))
+			continue
+		}
+		// a non-timeline resource or broken origin decodes into a zero
+		// manifest whose ChunkSize would divide by zero in Time2Chunk;
+		// never return or cache one (see resolveTimeline)
+		if manifest.ChunkSize <= 0 {
+			span.RecordError(fmt.Errorf("resource %s is not a chunkline timeline", tl))
+			continue
+		}
+		result[tl] = manifest
+
+		bytes, err := json.Marshal(manifest)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to marshal manifest for caching for %s: %w", tl, err))
+			continue
+		}
+
+		cacheItem := &memcache.Item{
+			Key:        manifestCacheKey(tl),
+			Value:      bytes,
+			Expiration: manifestCacheTTL,
+		}
+		err = r.mc.Set(cacheItem)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to set manifest in cache for %s: %w", tl, err))
+		}
+	}
+
+	return result, nil
+
+}
+
+// GetRemovedItems serves QueryDescending's per-timeline lists of recently
+// removed item IDs, loosely: the synchronous path only reads the shared
+// memcached copy (empty on a miss) so the timeline query is never blocked on
+// an origin, and a background goroutine refreshes stale entries from each
+// origin's manifest-advertised removed endpoint — deletions apply on the next
+// query. Deleted items lingering in results until then is accepted behavior.
+func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map[string][]string, error) {
+	ctx, span := tracer.Start(ctx, "ChunklineResolver.GetRemovedItems")
+	defer span.End()
+
+	keys := make([]string, len(timelines))
+	for i, tl := range timelines {
+		keys[i] = removedCacheKey(tl)
+	}
+
+	cachedItems, err := r.mc.GetMulti(keys)
+	if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+		span.RecordError(fmt.Errorf("failed to get removed items from cache: %w", err))
+	}
+
+	result := make(map[string][]string)
+	for _, tl := range timelines {
+		result[tl] = []string{}
+		item, found := cachedItems[removedCacheKey(tl)]
+		if !found {
+			continue
+		}
+		var ids []string
+		err := json.Unmarshal(item.Value, &ids)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to unmarshal cached removed items for %s: %w", tl, err))
+			continue
+		}
+		result[tl] = ids
+	}
+
+	// refresh the cache in the background; the request context may be gone
+	// before the origin answers, so the goroutine runs on its own context
+	go func(timelines []string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		freshKeys := make([]string, len(timelines))
+		for i, tl := range timelines {
+			freshKeys[i] = removedFreshKey(tl)
+		}
+		freshItems, err := r.mc.GetMulti(freshKeys)
+		if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+			slog.Error("chunkline removed: failed to get fresh markers", slog.String("error", err.Error()))
+		}
+
+		stale := make([]string, 0, len(timelines))
+		for _, tl := range timelines {
+			if _, found := freshItems[removedFreshKey(tl)]; found {
+				continue
+			}
+			stale = append(stale, tl)
+		}
+		if len(stale) == 0 {
+			return
+		}
+
+		manifests, err := r.ResolveTimelines(ctx, stale)
+		if err != nil {
+			slog.Error("chunkline removed: failed to resolve timelines", slog.String("error", err.Error()))
+			return
+		}
+
+		requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query url
+
+		for _, tl := range stale {
+			manifest, ok := manifests[tl]
+			if !ok {
+				continue
+			}
+
+			if manifest.Removed == "" {
+				continue // origin doesn't track removals
+			}
+
+			relPath, err := concrnt.RenderURITemplate(manifest.Removed, map[string]string{})
+			if err != nil {
+				slog.Error("chunkline removed: failed to render removed URI", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			rel, err := url.Parse(relPath)
+			if err != nil {
+				slog.Error("chunkline removed: invalid removed URI template", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			base, err := url.Parse(tl)
+			if err != nil {
+				slog.Error("chunkline removed: invalid timeline URI", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			endpoint := base.ResolveReference(rel)
+			if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+				host, err := r.client.ResolveResourceHost(ctx, tl)
+				if err != nil {
+					slog.Error("chunkline removed: failed to resolve host", slog.String("timeline", tl), slog.String("error", err.Error()))
+					continue
+				}
+				endpoint.Scheme = "https"
+				endpoint.Host = host
+			}
+
+			domain := endpoint.Host
+			if _, exists := requestsByDomain[domain]; !exists {
+				requestsByDomain[domain] = make(map[string]string)
+			}
+			requestsByDomain[domain][tl] = endpoint.String()
+		}
+
+		if len(requestsByDomain) == 0 {
+			return
+		}
+
+		responces, err := r.client.BatchGet(ctx, requestsByDomain)
+		if err != nil {
+			slog.Error("chunkline removed: batch request failed", slog.String("error", err.Error()))
+			return
+		}
+
+		for tl, resp := range responces {
+			if resp.StatusCode != http.StatusOK {
+				slog.Error("chunkline removed: non-200 response", slog.String("timeline", tl), slog.Int("status", resp.StatusCode))
+				continue
+			}
+
+			bytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				slog.Error("chunkline removed: failed to read response body", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			var ids []string
+			err = json.Unmarshal(bytes, &ids)
+			if err != nil {
+				slog.Error("chunkline removed: failed to unmarshal response", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+			if ids == nil {
+				ids = []string{}
+			}
+
+			value, err := json.Marshal(ids)
+			if err != nil {
+				slog.Error("chunkline removed: failed to marshal for caching", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			err = r.mc.Set(&memcache.Item{
+				Key:        removedCacheKey(tl),
+				Value:      value,
+				Expiration: removedCacheTTL,
+			})
+			if err != nil {
+				slog.Error("chunkline removed: failed to set cache", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
+			}
+
+			// mark fresh only on success so failed origins are retried on the
+			// next query
+			err = r.mc.Set(&memcache.Item{
+				Key:        removedFreshKey(tl),
+				Value:      []byte("1"),
+				Expiration: removedFreshTTL,
+			})
+			if err != nil {
+				slog.Error("chunkline removed: failed to set fresh marker", slog.String("timeline", tl), slog.String("error", err.Error()))
+			}
+		}
+	}(slices.Clone(timelines))
+
+	// errors never propagate: an unreachable origin must not fail the
+	// timeline query, the deleted items just linger until the next refresh
+	return result, nil
+}
+
+func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, until time.Time) (map[string]string, error) {
+	ctx, span := tracer.Start(ctx, "ChunklineResolver.LookupChunkItrs")
+	defer span.End()
+
+	manifests, err := r.ResolveTimelines(ctx, timelines)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	queries := make(map[string]int64)
+	keys := make([]string, 0, len(timelines))
+
+	for _, tl := range timelines {
+		manifest, ok := manifests[tl]
+		if !ok {
+			err := fmt.Errorf("missing chunkline manifest for timeline %s", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		if manifest.Descending.Iterator == "" {
+			err := fmt.Errorf("timeline %s does not support descending iteration", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		queryChunk := manifest.Time2Chunk(until)
+		if manifest.LastChunk != nil && queryChunk > *manifest.LastChunk {
+			queryChunk = *manifest.LastChunk
+		}
+
+		if manifest.FirstChunk != nil && queryChunk < *manifest.FirstChunk {
+			err := fmt.Errorf("query chunk %d is before first chunk %d for timeline %s", queryChunk, *manifest.FirstChunk, tl)
+			span.RecordError(err)
+			continue
+		}
+
+		queries[tl] = queryChunk
+		keys = append(keys, itrCacheKey(tl, queryChunk))
+	}
+
+	cachedItems, err := r.mc.GetMulti(keys)
+	if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+		span.RecordError(fmt.Errorf("failed to get iterators from cache: %w", err))
+	}
+
+	results := make(map[string]string)
+
+	requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query path
+
+	remainings := make(map[string]int64)
+
+	for tl, chunkID := range queries {
+		cacheKey := itrCacheKey(tl, chunkID)
+		if item, found := cachedItems[cacheKey]; found {
+			results[tl] = string(item.Value)
+			continue
+		}
+
+		manifest, ok := manifests[tl]
+		if !ok {
+			err := fmt.Errorf("missing chunkline manifest for timeline %s", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		if manifest.Descending.Iterator == "" {
+			err := fmt.Errorf("timeline %s does not support descending iteration", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		relPath, err := concrnt.RenderURITemplate(manifest.Descending.Iterator, map[string]string{
+			"chunk": fmt.Sprintf("%d", chunkID),
+		})
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to render iterator URI for timeline %s: %w", tl, err))
+			continue
+		}
+
+		rel, err := url.Parse(relPath)
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid iterator URI template for timeline %s: %w", tl, err))
+			continue
+		}
+
+		base, err := url.Parse(tl)
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid timeline URI %s: %w", tl, err))
+			continue
+		}
+
+		endpoint := base.ResolveReference(rel)
+		if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+			host, err := r.client.ResolveResourceHost(ctx, tl)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to resolve host for timeline %s: %w", tl, err))
+				continue
+			}
+			endpoint.Scheme = "https"
+			endpoint.Host = host
+		}
+
+		domain := endpoint.Host
+		if _, exists := requestsByDomain[domain]; !exists {
+			requestsByDomain[domain] = make(map[string]string)
+		}
+		requestsByDomain[domain][tl] = endpoint.String()
+		remainings[tl] = chunkID
+	}
+
+	if len(requestsByDomain) == 0 {
+		return results, nil // all results were cached
+	}
+
+	responces, err := r.client.BatchGet(ctx, requestsByDomain)
+	if err != nil {
+		span.RecordError(fmt.Errorf("batch request for iterators failed: %w", err))
+		return results, nil // return what we have from cache
+	}
+
+	currentSubscriptions := r.demand.CurrentSubscriptions()
+
+	for tl, chunkID := range remainings {
+		resp, ok := responces[tl]
+		if !ok {
+			err := fmt.Errorf("missing response for timeline %s", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			err := fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode)
+			span.RecordError(err)
+			continue
+		}
+
+		bytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to read response body for timeline %s: %w", tl, err))
+			continue
+		}
+
+		iterator := strings.TrimSpace(string(bytes))
+		// Older servers report "no iterator" as a 200 "0" instead of a 404.
+		// Chunk 0 is the 1970 epoch bucket and can never be a real iterator,
+		// so drop it (and empty bodies) before use and before caching.
+		if iterator == "" || iterator == "0" {
+			span.RecordError(fmt.Errorf("invalid iterator %q for timeline %s", iterator, tl))
+			continue
+		}
+		results[tl] = iterator
+
+		// もしキャッシュ対象が最新チャンクであれば、現在の購読状態を確認し、購読中でなければキャッシュを保存しない
+		if chunkID == manifests[tl].Time2Chunk(time.Now()) {
+			isSubscribed := slices.Contains(currentSubscriptions, tl)
+			if !isSubscribed {
+				continue // skip caching if not subscribed to the latest chunk
+			}
+		}
+
+		cacheItem := &memcache.Item{
+			Key:        itrCacheKey(tl, chunkID),
+			Value:      []byte(iterator),
+			Expiration: itrCacheTTL,
+		}
+		err = r.mc.Set(cacheItem)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to set iterator in cache for %s: %w", tl, err))
+		}
+	}
+
+	return results, nil
+}
+
+func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string) (map[string]chunkline.BodyChunk, error) {
+	ctx, span := tracer.Start(ctx, "ChunklineResolver.LoadChunkBodies")
+	defer span.End()
+
+	uris := []string{}
+	for itr := range query {
+		uris = append(uris, itr)
+	}
+
+	manifests, err := r.ResolveTimelines(ctx, uris)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(query))
+
+	for tl, itr := range query {
+		cacheKey := bodyCacheKey(tl, itr)
+		keys = append(keys, cacheKey)
+	}
+
+	results := make(map[string]chunkline.BodyChunk)
+
+	cachedItems, err := r.mc.GetMulti(keys)
+	if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+		span.RecordError(fmt.Errorf("failed to get chunk bodies from cache: %w", err))
+	}
+
+	requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query path
+
+	remaining := make(map[string]string)
+
+	for tl, itr := range query {
+		cacheKey := bodyCacheKey(tl, itr)
+		if item, found := cachedItems[cacheKey]; found {
+			var bodyItems []chunkline.BodyItem
+			cacheStr := string(item.Value)
+			cacheStr = cacheStr[1:]
+			cacheStr = "[" + cacheStr + "]"
+			err := json.Unmarshal([]byte(cacheStr), &bodyItems)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to unmarshal cached body chunk for %s: %w", tl, err))
+				fmt.Printf("invalid cache format for key %s: %s\n", cacheKey, cacheStr)
+				continue
+			}
+			// the cache updater blindly prepends, so a delayed event (e.g. a
+			// federated record whose authored time predates cached items) can
+			// leave the cached body unordered; readers binary-search on
+			// descending timestamps, so restore the order here
+			slices.SortStableFunc(bodyItems, func(a, b chunkline.BodyItem) int {
+				return b.Timestamp.Compare(a.Timestamp)
+			})
+			chunkID, err := strconv.ParseInt(itr, 10, 64)
+			if err != nil {
+				span.RecordError(fmt.Errorf("invalid chunk ID %s for timeline %s: %w", itr, tl, err))
+				continue
+			}
+			results[tl] = chunkline.BodyChunk{
+				URI:     tl,
+				ChunkID: chunkID,
+				Items:   bodyItems,
+			}
+			continue // cached: no origin fetch needed (a cached latest chunk is kept fresh by the cache updater)
+		}
+
+		manifest, ok := manifests[tl]
+		if !ok {
+			err := fmt.Errorf("missing chunkline manifest for timeline %s", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		if manifest.Descending.Body == "" {
+			err := fmt.Errorf("timeline %s does not support descending body retrieval", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		refPath, err := concrnt.RenderURITemplate(manifest.Descending.Body, map[string]string{
+			"chunk": itr,
+		})
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid body URI template for timeline %s: %w", tl, err))
+			continue
+		}
+		ref, err := url.Parse(refPath)
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid body URI template for timeline %s: %w", tl, err))
+			continue
+		}
+
+		base, err := url.Parse(tl)
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid timeline URI %s: %w", tl, err))
+			continue
+		}
+
+		endpoint := base.ResolveReference(ref)
+		if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+			host, err := r.client.ResolveResourceHost(ctx, tl)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to resolve host for timeline %s: %w", tl, err))
+				continue
+			}
+			endpoint.Scheme = "https"
+			endpoint.Host = host
+		}
+
+		domain := endpoint.Host
+		if _, exists := requestsByDomain[domain]; !exists {
+			requestsByDomain[domain] = make(map[string]string)
+		}
+		requestsByDomain[domain][tl] = endpoint.String()
+		remaining[tl] = itr
+	}
+
+	if len(requestsByDomain) == 0 {
+		return results, nil // all results were cached
+	}
+
+	responses, err := r.client.BatchGet(ctx, requestsByDomain)
+	if err != nil {
+		span.RecordError(fmt.Errorf("batch request for chunk bodies failed: %w", err))
+		return results, nil // return what we have from cache
+	}
+
+	currentSubscriptions := r.demand.CurrentSubscriptions()
+
+	for tl, itr := range remaining {
+		resp, ok := responses[tl]
+		if !ok {
+			err := fmt.Errorf("missing response for timeline %s", tl)
+			span.RecordError(err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			err := fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode)
+			span.RecordError(err)
+			continue
+		}
+
+		var items []chunkline.BodyItem
+		err = json.NewDecoder(resp.Body).Decode(&items)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to decode chunk body for timeline %s: %w", tl, err))
+			continue
+		}
+
+		chunkID, err := strconv.ParseInt(itr, 10, 64)
+		if err != nil {
+			span.RecordError(fmt.Errorf("invalid chunk ID %s for timeline %s: %w", itr, tl, err))
+			continue
+		}
+
+		bodyChunk := chunkline.BodyChunk{
+			URI:     tl,
+			ChunkID: chunkID,
+			Items:   items,
+		}
+		results[tl] = bodyChunk
+
+		isLatestChunk := chunkID == manifests[tl].Time2Chunk(time.Now())
+
+		// もしキャッシュ対象が最新チャンクであれば、現在の購読状態を確認し、購読中でなければキャッシュを保存しない
+		if isLatestChunk {
+			isSubscribed := slices.Contains(currentSubscriptions, tl)
+			if !isSubscribed {
+				continue // skip caching if not subscribed to the latest chunk
+			}
+		}
+
+		serialized, err := json.Marshal(items)
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to marshal body chunk for caching for %s: %w", tl, err))
+			continue
+		}
+
+		cacheStr := "," + string(serialized[1:len(serialized)-1])
+		cacheItem := &memcache.Item{
+			Key:        bodyCacheKey(tl, itr),
+			Value:      []byte(cacheStr),
+			Expiration: bodyCacheTTL,
+		}
+		if isLatestChunk {
+			// Add, not Set: a live latest chunk may already be maintained by
+			// the cache updater, and clobbering it with this (possibly older)
+			// origin fetch would drop the records prepended since
+			err = r.mc.Add(cacheItem)
+			if errors.Is(err, memcache.ErrNotStored) {
+				err = nil
+			}
+		} else {
+			err = r.mc.Set(cacheItem)
+		}
+		if err != nil {
+			span.RecordError(fmt.Errorf("failed to set body chunk in cache for %s: %w", tl, err))
+		}
+
+		// もしキャッシュ対象が最新チャンクなのであれば、itrも更新する必要がある
+		if chunkID == manifests[tl].Time2Chunk(time.Now()) {
+			cacheItem := &memcache.Item{
+				Key:        itrCacheKey(tl, chunkID),
+				Value:      []byte(itr),
+				Expiration: itrCacheTTL,
+			}
+			err = r.mc.Set(cacheItem)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to set iterator in cache for %s: %w", tl, err))
+			}
+		}
+	}
+
+	return results, nil
+}
+
+func (r *resolver) CurrentSubscriptions() []string {
+	// start from the prefixes whose upstream subscription is actually open:
+	// "open + latest chunk cached => keep" is self-sustaining regardless of
+	// which replica wrote the cache, whereas demand-based input would drop
+	// the timeline in the same tick its demand lapses, orphaning the cache
+	var ongoing []string
+	if r.open != nil {
+		ongoing = r.open.OpenPrefixes()
+	} else {
+		ongoing = r.demand.CurrentSubscriptions()
+	}
+
+	timelines, err := r.ResolveTimelines(context.Background(), ongoing)
+	if err != nil {
+		return ongoing // fallback to raw URIs if manifest resolution fails
+	}
+
+	keep := []string{}
+	for _, tl := range ongoing {
+		manifest, ok := timelines[tl]
+		if !ok {
+			continue
+		}
+
+		currentChunk := manifest.Time2Chunk(time.Now())
+
+		// bodyの最新チャンクのキャッシュが存在する場合は、残しておかないとキャッシュが古いままになってしまう
+		latestChunkKey := bodyCacheKey(tl, fmt.Sprintf("%d", currentChunk))
+		_, err := r.mc.Get(latestChunkKey)
+		if err == nil {
+			keep = append(keep, tl)
+			continue
+		}
+
+		// 最新チャンク-1がなければ、確定で終了して良い
+		prevChunkKey := bodyCacheKey(tl, fmt.Sprintf("%d", currentChunk-1))
+		_, err = r.mc.Get(prevChunkKey)
+		if err != nil {
+			continue
+		}
+
+		// 前チャンクがあり最新がまだ作成されてない場合、現在チャンクの80%が経過するまでは待機しておく
+		now := time.Now()
+		currentChunkStart := manifest.Chunk2Time(currentChunk)
+		currentChunkEnd := manifest.Chunk2Time(currentChunk + 1)
+		currentChunkDuration := currentChunkEnd.Sub(currentChunkStart)
+		if now.Before(currentChunkStart.Add(currentChunkDuration * 8 / 10)) {
+			keep = append(keep, tl)
+			continue
+		}
+	}
+
+	return keep
+}
+
+func (r *resolver) cacheUpdater(ctx context.Context) {
+
+	events := make(chan concrnt.Event)
+
+	go r.pubsub.SubscribeAll(ctx, events)
+
+	for {
+		var event concrnt.Event
+		select {
+		case <-ctx.Done():
+			return
+		case event = <-events:
+		}
+
+		if event.Type != "created" {
+			continue
+		}
+
+		r.applyEventToCache(ctx, event)
+	}
+}
+
+// applyEventToCache maintains the cached chunk of the timeline that gained a
+// record. The event arrives on the record's own key (`<timeline>/<id>`, the
+// channel prefix subscribers match on), never on the bare timeline URI, so
+// the timeline whose chunk cache readers hit is the record key's parent.
+//
+// The item is blindly prepended: chunkline tolerates duplicates (readers
+// deduplicate by href) and unordered chunks (LoadChunkBodies sorts cached
+// bodies on read), so no read-modify-write is needed — a concurrent updater
+// during a leadership handover or a racing origin fetch at worst duplicates
+// the record. Prepend and Replace never create keys, so an unmaintained
+// timeline stays uncached.
+func (r *resolver) applyEventToCache(ctx context.Context, event concrnt.Event) {
+	// the parent of the created record is the timeline it entered
+	authority := strings.Index(event.URI, "://")
+	cut := strings.LastIndex(event.URI, "/")
+	if authority == -1 || cut <= authority+2 {
+		return // a root key belongs to no timeline; nothing to maintain
+	}
+	timeline := event.URI[:cut]
+
+	manifest, err := r.resolveTimeline(ctx, timeline)
+	if err != nil {
+		slog.Error("failed to resolve timeline for caching", slog.String("timeline", timeline), slog.String("error", err.Error()))
+		return
+	}
+	epoch := manifest.Time2Chunk(event.Timestamp)
+
+	// repoint the cached iterator to this epoch before touching the body:
+	// even when no body is cached, a cached iterator from a read during an
+	// empty epoch still steers readers to an older chunk and would hide this
+	// record until the epoch rolls over.
+	err = r.mc.Replace(&memcache.Item{Key: itrCacheKey(timeline, epoch), Value: []byte(strconv.FormatInt(epoch, 10)), Expiration: itrCacheTTL})
+	if err != nil && !errors.Is(err, memcache.ErrNotStored) {
+		slog.Error("failed to replace iterator in cache", slog.String("timeline", timeline), slog.String("error", err.Error()))
+	}
+
+	// the cached entry must mirror what the origin body endpoint serves
+	// (LoadLocalBody): a reference record enters the timeline as its redirect
+	// target (which is also what readers deduplicate by), everything else as
+	// the record key itself
+	href := event.URI
+	if sd, ok := event.References[event.URI]; ok {
+		var doc concrnt.Document[schemas.Reference]
+		if err := json.Unmarshal([]byte(sd.Document), &doc); err == nil && doc.Schema == schemas.ReferenceURL && doc.Value.Href != "" {
+			href = doc.Value.Href
+		}
+	}
+
+	serializedItem, err := json.Marshal(chunkline.BodyItem{
+		Timestamp:   event.Timestamp,
+		Href:        href,
+		ContentType: "application/concrnt.document+json",
+	})
+	if err != nil {
+		slog.Error("failed to marshal body item for caching", slog.String("timeline", timeline), slog.String("error", err.Error()))
+		return
+	}
+
+	bodyKey := bodyCacheKey(timeline, strconv.FormatInt(epoch, 10))
+	err = r.mc.Prepend(&memcache.Item{Key: bodyKey, Value: append([]byte(","), serializedItem...)})
+	if err != nil && !errors.Is(err, memcache.ErrNotStored) {
+		slog.Error("failed to prepend body item in cache", slog.String("timeline", timeline), slog.String("error", err.Error()))
+	}
+}
+
+// PurgeLatest drops the cached latest chunk (and, for depth 2, the previous
+// one) of each timeline. The subscriber calls this when an upstream
+// subscription opens or closes: a cached latest chunk is only valid while the
+// leader is receiving events for it, so both edges invalidate whatever was
+// cached before or during the unsubscribed gap.
+func (r *resolver) PurgeLatest(prefixes []string, depth int) {
+	if len(prefixes) == 0 {
+		return
+	}
+
+	// deliberately not the caller's context: purge-on-close also runs while
+	// the lead context is already cancelled
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	manifests, err := r.ResolveTimelines(ctx, prefixes)
+	if err != nil {
+		slog.Error("failed to resolve timelines for cache purge", slog.String("error", err.Error()))
+		return
+	}
+
+	for _, tl := range prefixes {
+		manifest, ok := manifests[tl]
+		if !ok {
+			continue
+		}
+		current := manifest.Time2Chunk(time.Now())
+		for i := range int64(depth) {
+			chunk := current - i
+			if err := r.mc.Delete(itrCacheKey(tl, chunk)); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+				slog.Error("failed to purge iterator cache", slog.String("timeline", tl), slog.String("error", err.Error()))
+			}
+			if err := r.mc.Delete(bodyCacheKey(tl, strconv.FormatInt(chunk, 10))); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+				slog.Error("failed to purge body cache", slog.String("timeline", tl), slog.String("error", err.Error()))
+			}
+		}
+	}
+
+	if depth == 1 {
+		// close edge: a worker whose cached aggregate predates this close can
+		// still consider these prefixes subscribed for a few seconds and
+		// re-cache an unmaintained latest chunk (mc.Add succeeds precisely
+		// because the delete above just removed the key). Sweep again after
+		// the workers' view has expired; a spurious delete only costs one
+		// cache miss.
+		keys := make([]string, 0, len(prefixes)*2)
+		for _, tl := range prefixes {
+			manifest, ok := manifests[tl]
+			if !ok {
+				continue
+			}
+			chunk := manifest.Time2Chunk(time.Now())
+			keys = append(keys, itrCacheKey(tl, chunk), bodyCacheKey(tl, strconv.FormatInt(chunk, 10)))
+		}
+		time.AfterFunc(purgeReplayDelay, func() {
+			for _, key := range keys {
+				if err := r.mc.Delete(key); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+					slog.Error("failed to replay cache purge", slog.String("key", key), slog.String("error", err.Error()))
+				}
+			}
+		})
+	}
+}
