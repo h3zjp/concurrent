@@ -50,10 +50,10 @@ import (
 )
 
 var (
-	version      = "unknown"
-	buildMachine = "unknown"
-	buildTime    = "unknown"
-	goVersion    = "unknown"
+	version      = "v1.11.11"
+	buildMachine = "AlmaLinux release 9.9 (Chartreuse Bobcat)"
+	buildTime    = "Tue Nov 19 17:06:00 UTC 2026"
+	goVersion    = "go1.26.5 linux/amd64"
 )
 
 const readinessTimeout = 800 * time.Millisecond
@@ -201,7 +201,7 @@ func main() {
 
 	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
 	if internalPort == "" {
-		internalPort = "8001"
+		internalPort = "8011"
 	}
 
 	clustered := conf.Concrnt.Cluster.Enable
@@ -398,8 +398,8 @@ func main() {
 
 	apiDone := make(chan error, 1)
 	internalDone := make(chan error, 1)
-	go start(context.Background(), ":"+internalPort, internal, internalDone)
-	go start(apiCtx, ":8000", e, apiDone)
+	go start(context.Background(), "192.168.10.3:"+internalPort, internal, internalDone)
+	go start(apiCtx, "192.168.10.3:8010", e, apiDone)
 
 	select {
 	case <-ctx.Done():
