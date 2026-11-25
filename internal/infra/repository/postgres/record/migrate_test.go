@@ -4,8 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/concrnt/concrnt/internal/testutil"
 )
 
 // Migrate must succeed on a fresh database and be re-runnable on an
@@ -20,7 +21,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	require.NoError(t, repo.Migrate())
 
 	for _, model := range []any{
-		&CommitLog{}, &Record{}, &RecordKey{}, &Association{},
+		&CommitLog{}, &RecordKey{}, &Association{},
 		&Ack{}, &Acked{}, &Entity{},
 	} {
 		require.True(t, db.Migrator().HasTable(model), "table for %T must exist after migration", model)
@@ -53,4 +54,11 @@ func TestMigrateIsIdempotent(t *testing.T) {
 		}
 	}
 	require.True(t, hasCDateID, "commit_logs must have idx_commit_logs_c_date_id on (c_date, id), got %+v", indexes)
+
+	// URI prefix ranges need a text_pattern_ops index on record_keys.uri
+	// (under a non-C collation the unique index on uri cannot serve them),
+	// covering the columns QueryByPrefix picks its window by.
+	var uriPatternDef string
+	require.NoError(t, db.Raw("SELECT indexdef FROM pg_indexes WHERE tablename = 'record_keys' AND indexname = 'idx_record_keys_uri_pattern_include'").Scan(&uriPatternDef).Error)
+	require.Contains(t, uriPatternDef, "(uri text_pattern_ops) INCLUDE (record_created_at, record_id, id)")
 }

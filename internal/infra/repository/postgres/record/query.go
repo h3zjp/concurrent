@@ -3,8 +3,11 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
+	"unicode/utf8"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -20,37 +23,44 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
-	var rks []RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id").
-		Where("uri LIKE ?", prefix+"%")
+	// The window is picked by ids alone and the rows are fetched afterwards:
+	// postgres neither pushes a LIMIT below the commit log join nor defers
+	// reading the rows it sorts away, so selecting the full rows here reads
+	// every key under the prefix. Selecting only columns of
+	// idx_record_keys_uri_pattern_include makes it an index-only scan.
+	window := r.db.Model(&RecordKey{}).
+		Select("id").
+		Where("record_id IS NOT NULL AND uri ~>=~ ? AND uri ~<~ ?", prefix, prefixEnd(prefix))
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		window = window.Where("schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		window = window.Where("author = ?", author)
 	}
 	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
+		window = window.Where("record_created_at >= ?", *since)
 	}
 	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
+		window = window.Where("record_created_at <= ?", *until)
 	}
 
+	ordering := "record_keys.record_created_at ASC, record_keys.record_id ASC"
 	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
-	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
+		ordering = "record_keys.record_created_at DESC, record_keys.record_id DESC"
 	}
+	window = window.Order(ordering)
 
 	if limit > 0 {
-		query = query.Limit(limit)
+		window = window.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rks, err := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
+		Where("record_keys.id IN (?)", window).
+		Order(ordering).
+		Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -58,32 +68,33 @@ func (r *Repository) QueryByPrefix(
 	return recordKeysToQueryRows(rks, span)
 }
 
-// likeEscaper escapes LIKE metacharacters so a key containing '%' or '_'
-// can't over-match when embedded in a pattern.
-var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+func prefixEnd(prefix string) string {
+	r, size := utf8.DecodeLastRuneInString(prefix)
+	return prefix[:len(prefix)-size] + string(r+1)
+}
 
 // QueryRecordSubtree returns every live record whose key is base itself
 // (includeSelf) or lies under base's path subtree (base + "/..."), ordered by
 // URI so base leads. Unlike QueryByPrefix's raw prefix match this never picks
-// up sibling keys ("item2" for base "item"), and metacharacters in base are
-// escaped — the result is exactly the set a range delete may remove.
+// up sibling keys ("item2" for base "item") — the result is exactly the set a
+// range delete may remove.
 func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
+		Where("record_keys.record_id IS NOT NULL")
 
-	subtreePattern := likeEscaper.Replace(base) + `/%`
+	subtree := base + "/"
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		query = query.Where("record_keys.uri = ? OR (record_keys.uri ~>=~ ? AND record_keys.uri ~<~ ?)", base, subtree, prefixEnd(subtree))
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where("record_keys.uri ~>=~ ? AND record_keys.uri ~<~ ?", subtree, prefixEnd(subtree))
 	}
 
-	var rks []RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	rks, err := query.Order("record_keys.uri ASC").Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -91,18 +102,18 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	sds := make([]concrnt.SignedDocument, 0, len(rks))
 	for _, rk := range rks {
 		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
+		err := json.Unmarshal([]byte(rk.Document.Proof), &proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
+		ccfs := concrnt.ComposeCCFSURI(rk.Owner, concrnt.CCFSTypeConcrnt, *rk.RecordID)
 
 		sds = append(sds, concrnt.SignedDocument{
 			CCKV:     &rk.URI,
 			CCFS:     &ccfs,
-			Document: rk.Record.Document.Document,
+			Document: rk.Document.Document,
 			Proof:    proof,
 		})
 	}
@@ -120,11 +131,13 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	var rks []RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+	// record_created_at IS NOT NULL keeps placeholders out and matches the
+	// predicate of the partial idx_record_keys_parent_created_at_record_id,
+	// which serves the ordering, so the limit applies before the commit log
+	// join.
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
+		Where("record_keys.record_id IS NOT NULL AND record_keys.record_created_at IS NOT NULL")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -135,35 +148,37 @@ func (r *Repository) QueryByParent(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		root := "cckv://" + parsedParent.Owner + "/"
+		query = query.Where("record_keys.parent_id IS NULL AND record_keys.uri ~>=~ ? AND record_keys.uri ~<~ ?", root, prefixEnd(root))
 	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+		query = query.Where("record_keys.parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		query = query.Where("record_keys.schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		query = query.Where("record_keys.author = ?", author)
 	}
 	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
+		query = query.Where("record_keys.record_created_at >= ?", *since)
 	}
 	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
+		query = query.Where("record_keys.record_created_at <= ?", *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
+		query = query.Order("record_keys.record_created_at DESC, record_keys.record_id DESC")
 	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
+		query = query.Order("record_keys.record_created_at ASC, record_keys.record_id ASC")
 	}
 
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rks, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -172,9 +187,9 @@ func (r *Repository) QueryByParent(
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
-// cckv (CIP-5 orderby=key). The LEFT JOIN keeps placeholder keys (record_id
-// NULL) so intermediate keys come back as key-only rows; a schema or author
-// filter compares record columns and so drops them. since/until are
+// cckv (CIP-5 orderby=key). Placeholder keys (record_id NULL; the commit log
+// join is a LEFT JOIN) come back as key-only rows; a schema or author filter
+// compares record columns and so drops them. since/until are
 // inclusive key bounds, the cursors of §3.3 for this ordering.
 func (r *Repository) QueryByParentOrderByKey(
 	ctx context.Context,
@@ -186,11 +201,8 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	var rks []RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil)
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -198,16 +210,17 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		root := "cckv://" + parsedParent.Owner + "/"
+		query = query.Where("record_keys.parent_id IS NULL AND record_keys.uri ~>=~ ? AND record_keys.uri ~<~ ?", root, prefixEnd(root))
 	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+		query = query.Where("record_keys.parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		query = query.Where("record_keys.schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		query = query.Where("record_keys.author = ?", author)
 	}
 	if since != nil {
 		query = query.Where("record_keys.uri >= ?", *since)
@@ -226,7 +239,8 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rks, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

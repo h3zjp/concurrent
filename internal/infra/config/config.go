@@ -70,12 +70,13 @@ type WellKnownEntry struct {
 }
 
 type Concrnt struct {
-	FQDN         string  `yaml:"fqdn"`
-	PrivateKey   string  `yaml:"privatekey"`
-	Registration string  `yaml:"registration"` // open, invite, close
-	Layer        string  `yaml:"layer"`
-	Debug        bool    `yaml:"debug"`
-	Cluster      Cluster `yaml:"cluster"`
+	FQDN                 string  `yaml:"fqdn"`
+	PrivateKey           string  `yaml:"privatekey"`
+	Registration         string  `yaml:"registration"` // open, invite, close
+	Layer                string  `yaml:"layer"`
+	Debug                bool    `yaml:"debug"`
+	Cluster              Cluster `yaml:"cluster"`
+	RestoreSchemeSlashes bool    `yaml:"restoreSchemeSlashes"`
 }
 
 type Cluster struct {
@@ -90,11 +91,14 @@ type Cluster struct {
 }
 
 type Backends struct {
-	PostgresDsn   string `yaml:"postgresDsn"`
-	GatewayAddr   string `yaml:"gatewayAddr"`
-	RedisAddr     string `yaml:"redisAddr"`
-	RedisDB       int    `yaml:"redisDB"`
-	MemcachedAddr string `yaml:"memcachedAddr"`
+	PostgresDsn string `yaml:"postgresDsn"`
+	// PostgresMaxConns is the connection pool size of one process (default
+	// 16); half of it may run transactions at once.
+	PostgresMaxConns int    `yaml:"postgresMaxConns"`
+	GatewayAddr      string `yaml:"gatewayAddr"`
+	RedisAddr        string `yaml:"redisAddr"`
+	RedisDB          int    `yaml:"redisDB"`
+	MemcachedAddr    string `yaml:"memcachedAddr"`
 }
 
 type Observability struct {
